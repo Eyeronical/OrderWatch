@@ -1,6 +1,8 @@
+// src/services/api.js
 import DOMPurify from 'dompurify'
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001'
+const RAW_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5001'
+const API_BASE_URL = RAW_BASE.replace(/\/$/, '') // normalize trailing slash
 const API_KEY = import.meta.env.VITE_API_KEY || null
 const REQUEST_TIMEOUT = parseInt(import.meta.env.VITE_REQUEST_TIMEOUT) || 30000
 const IS_PRODUCTION = import.meta.env.PROD
@@ -64,18 +66,35 @@ const safeLog = (level, message, data = null) => {
   }
 }
 
+// URL helpers
+const encodeQS = (params = {}) =>
+  Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+    .join('&')
+
+const withKeyQS = (qs) => {
+  if (!API_KEY) return qs
+  return { ...qs, api_key: API_KEY }
+}
+
+const buildUrl = (path, qs = {}) => {
+  const qsAll = withKeyQS(qs)
+  const str = encodeQS(qsAll)
+  const url = `${API_BASE_URL}${path}${str ? `?${str}` : ''}`
+  return url
+}
+
 const activeRequests = new Map()
 const getRequestKey = (url, options) => `${options.method || 'GET'}:${url}:${JSON.stringify(options.body || {})}`
-
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
 const makeRequestWithRetry = async (url, options = {}, attempt = 1) => {
   try {
     return await makeRequest(url, options)
   } catch (error) {
-    if (attempt >= MAX_RETRY_ATTEMPTS) throw error
-    const shouldRetry = error.status === 0 || error.status >= 500 || error.name === 'AbortError'
-    if (!shouldRetry) throw error
+    const retriable = error.status === 0 || error.status >= 500 || error.name === 'AbortError' || error.status === 429
+    if (!retriable || attempt >= MAX_RETRY_ATTEMPTS) throw error
     const retryDelay = RETRY_DELAY * Math.pow(2, attempt - 1)
     safeLog('info', `Retrying request in ${retryDelay}ms (attempt ${attempt}/${MAX_RETRY_ATTEMPTS})`)
     await delay(retryDelay)
@@ -97,6 +116,7 @@ const makeRequest = async (url, options = {}) => {
 
   const requestPromise = (async () => {
     try {
+      // Sanitize JSON bodies
       if (options.body) {
         try {
           const bodyData = JSON.parse(options.body)
@@ -110,21 +130,22 @@ const makeRequest = async (url, options = {}) => {
       const defaultHeaders = {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        'X-Requested-With': 'XMLHttpRequest'
+        'X-Requested-With': 'XMLHttpRequest',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
       }
       if (API_KEY) {
         defaultHeaders['X-API-Key'] = API_KEY
       }
-      defaultHeaders['Cache-Control'] = 'no-cache'
-      defaultHeaders['Pragma'] = 'no-cache'
 
       const defaultOptions = {
+        mode: 'cors',
         credentials: 'same-origin',
         signal: controller.signal,
         headers: defaultHeaders
       }
 
-      const response = await fetch(`${API_BASE_URL}${url}`, {
+      const response = await fetch(url, {
         ...defaultOptions,
         ...options,
         headers: { ...defaultHeaders, ...options.headers }
@@ -146,12 +167,15 @@ const makeRequest = async (url, options = {}) => {
           errorMessage = sanitizeInput(errorData.error || errorData.message || errorMessage)
           errorData = sanitizeInput(errorData)
         } catch {}
+        if (response.status === 401) {
+          errorMessage = 'Unauthorized: missing or invalid API key'
+        }
         throw new ApiError(errorMessage, response.status, errorData)
       }
 
-      const contentType = response.headers.get('content-type')
+      const contentType = response.headers.get('content-type') || ''
       let responseData
-      if (contentType && contentType.includes('application/json')) {
+      if (contentType.includes('application/json')) {
         responseData = await response.json()
         responseData = sanitizeInput(responseData)
       } else {
@@ -183,8 +207,9 @@ const makeRequest = async (url, options = {}) => {
 const apiService = {
   async checkHealth() {
     try {
-      const response = await makeRequestWithRetry(ENDPOINTS.HEALTH, { method: 'GET' })
-      validateResponse(response, ['status'])
+      const url = buildUrl(ENDPOINTS.HEALTH)
+      const response = await makeRequestWithRetry(url, { method: 'GET' })
+      validateResponse(response, ['status', 'message'])
       safeLog('info', 'API Health Check Success', { status: response.status, timestamp: response.timestamp })
       return { success: true, data: response, message: 'Server is healthy' }
     } catch (error) {
@@ -193,6 +218,7 @@ const apiService = {
     }
   },
 
+  // Starts a new job and returns jobId
   async startScraping(date) {
     try {
       const sanitizedDate = sanitizeInput(date)
@@ -205,32 +231,35 @@ const apiService = {
       const dateObj = new Date(sanitizedDate)
       const today = new Date()
       const minDate = new Date('2010-01-01')
-      if (isNaN(dateObj.getTime())) {
-        throw new ApiError('Invalid date provided', 400)
-      }
-      if (dateObj > today) {
-        throw new ApiError('Date cannot be in the future', 400)
-      }
-      if (dateObj < minDate) {
-        throw new ApiError('Date cannot be before 2010', 400)
-      }
-      const response = await makeRequestWithRetry(ENDPOINTS.SCRAPE, {
+      if (isNaN(dateObj.getTime())) throw new ApiError('Invalid date provided', 400)
+      if (dateObj > today) throw new ApiError('Date cannot be in the future', 400)
+      if (dateObj < minDate) throw new ApiError('Date cannot be before 2010', 400)
+
+      const url = buildUrl(ENDPOINTS.SCRAPE)
+      const response = await makeRequestWithRetry(url, {
         method: 'POST',
         body: JSON.stringify({ date: sanitizedDate })
       })
-      validateResponse(response, ['message'])
-      safeLog('info', 'Scraping Started', { date: sanitizedDate, message: response.message })
-      return { success: true, data: response, message: 'Scraping started successfully' }
+
+      // Expect job_id from backend
+      validateResponse(response, ['message', 'job_id'])
+      const jobId = response.job_id
+      safeLog('info', 'Scraping Started', { date: sanitizedDate, jobId, message: response.message })
+      return { success: true, data: response, jobId, message: 'Scraping started successfully' }
     } catch (error) {
-      safeLog('error', 'Failed to Start Scraping', { date: date, error: error.message, status: error.status })
+      safeLog('error', 'Failed to Start Scraping', { date, error: error.message, status: error.status })
       return { success: false, error: error.message, status: error.status || 0 }
     }
   },
 
-  async getScrapingStatus() {
+  // Requires jobId
+  async getScrapingStatus(jobId) {
     try {
-      const response = await makeRequest(ENDPOINTS.STATUS, { method: 'GET' })
-      validateResponse(response, ['is_running'])
+      const sanitizedJobId = sanitizeInput(jobId)
+      if (!sanitizedJobId) throw new ApiError('job_id is required', 400)
+      const url = buildUrl(ENDPOINTS.STATUS, { job_id: sanitizedJobId })
+      const response = await makeRequest(url, { method: 'GET' })
+      validateResponse(response, ['is_running', 'progress', 'message'])
       return {
         success: true,
         data: response,
@@ -244,10 +273,15 @@ const apiService = {
     }
   },
 
-  async getResults() {
+  // Requires jobId
+  async getResults(jobId) {
     try {
-      const response = await makeRequest(ENDPOINTS.RESULTS, { method: 'GET' })
+      const sanitizedJobId = sanitizeInput(jobId)
+      if (!sanitizedJobId) throw new ApiError('job_id is required', 400)
+      const url = buildUrl(ENDPOINTS.RESULTS, { job_id: sanitizedJobId })
+      const response = await makeRequest(url, { method: 'GET' })
       if (!(response && typeof response === 'object' && response.success === true && Array.isArray(response.orders))) {
+        // If backend is still processing it may return 202 or message; treat as not ready
         throw new ApiError('Results not ready', 202)
       }
       safeLog('info', 'Results Retrieved', {
@@ -262,25 +296,34 @@ const apiService = {
     }
   },
 
-  async stopScraping() {
+  // Requires jobId
+  async stopScraping(jobId) {
     try {
-      const response = await makeRequest(ENDPOINTS.STOP, { method: 'POST' })
-      safeLog('info', 'Scraping Stopped', response)
-      return { success: true, data: response, message: 'Scraping stopped successfully' }
+      const sanitizedJobId = sanitizeInput(jobId)
+      if (!sanitizedJobId) throw new ApiError('job_id is required', 400)
+      const url = buildUrl(ENDPOINTS.STOP, { job_id: sanitizedJobId })
+      const response = await makeRequest(url, { method: 'POST' })
+      validateResponse(response, ['message'])
+      safeLog('info', 'Scraping Stopped', { jobId: sanitizedJobId })
+      return { success: true, data: response, message: 'Scraping stop requested' }
     } catch (error) {
       safeLog('error', 'Failed to Stop Scraping', { error: error.message, status: error.status })
       return { success: false, error: error.message, status: error.status || 0 }
     }
   },
 
-  async pollScrapingProgress(onProgress, pollInterval = 2000) {
+  // Poll a specific job until it completes
+  async pollScrapingProgress(jobId, onProgress, pollInterval = 2000) {
+    if (!jobId) {
+      return { success: false, error: 'job_id is required', status: 400 }
+    }
     if (onProgress && typeof onProgress !== 'function') {
       throw new ApiError('onProgress must be a function', 400)
     }
     const safePollInterval = Math.max(1000, Math.min(10000, pollInterval))
     return new Promise((resolve) => {
       let pollCount = 0
-      const maxPolls = 300
+      const maxPolls = 300 // up to 10 minutes at 2s intervals by default
       const poll = async () => {
         try {
           pollCount++
@@ -288,7 +331,7 @@ const apiService = {
             resolve({ success: false, error: 'Polling timeout - operation took too long', status: 408 })
             return
           }
-          const statusResponse = await this.getScrapingStatus()
+          const statusResponse = await apiService.getScrapingStatus(jobId)
           if (!statusResponse.success) {
             resolve({ success: false, error: statusResponse.error, status: statusResponse.status })
             return
@@ -310,13 +353,12 @@ const apiService = {
               resolve({ success: true, data: data.results, message: 'Scraping completed successfully' })
               return
             }
-            const resultsResponse = await this.getResults()
-            if (!resultsResponse.success) {
-              setTimeout(poll, safePollInterval)
+            const resultsResponse = await apiService.getResults(jobId)
+            if (resultsResponse.success) {
+              resolve(resultsResponse)
               return
             }
-            resolve(resultsResponse)
-            return
+            // If results not ready yet, continue polling briefly
           }
           setTimeout(poll, safePollInterval)
         } catch (error) {
@@ -333,9 +375,7 @@ export const utils = {
     try {
       const sanitizedDate = sanitizeInput(dateString)
       const date = new Date(sanitizedDate)
-      if (isNaN(date.getTime())) {
-        return 'Invalid Date'
-      }
+      if (isNaN(date.getTime())) return 'Invalid Date'
       return date.toLocaleDateString('en-US', {
         weekday: 'long',
         year: 'numeric',
@@ -349,12 +389,8 @@ export const utils = {
 
   formatCurrency(amount) {
     const safeAmount = Number(amount)
-    if (isNaN(safeAmount) || safeAmount < 0) {
-      return '₹0.00 Cr'
-    }
-    if (safeAmount >= 1000) {
-      return `₹${(safeAmount / 1000).toFixed(1)}K Cr`
-    }
+    if (isNaN(safeAmount) || safeAmount < 0) return '₹0.00 Cr'
+    if (safeAmount >= 1000) return `₹${(safeAmount / 1000).toFixed(1)}K Cr`
     return `₹${safeAmount.toFixed(2)} Cr`
   },
 
@@ -362,9 +398,7 @@ export const utils = {
     try {
       const sanitizedDate = sanitizeInput(dateString)
       const date = new Date(sanitizedDate)
-      if (isNaN(date.getTime())) {
-        return false
-      }
+      if (isNaN(date.getTime())) return false
       const day = date.getDay()
       return day === 0 || day === 6
     } catch {
@@ -383,15 +417,9 @@ export const utils = {
     const date = new Date(sanitizedDate)
     const today = new Date()
     const minDate = new Date('2010-01-01')
-    if (isNaN(date.getTime())) {
-      return { isValid: false, error: 'Invalid date' }
-    }
-    if (date > today) {
-      return { isValid: false, error: 'Date cannot be in the future' }
-    }
-    if (date < minDate) {
-      return { isValid: false, error: 'Date cannot be before 2010' }
-    }
+    if (isNaN(date.getTime())) return { isValid: false, error: 'Invalid date' }
+    if (date > today) return { isValid: false, error: 'Date cannot be in the future' }
+    if (date < minDate) return { isValid: false, error: 'Date cannot be before 2010' }
     const isWeekendDate = this.isWeekend(sanitizedDate)
     return {
       isValid: true,
@@ -431,21 +459,15 @@ export const HTTP_STATUS = {
 
 export const RESPONSE_SCHEMAS = {
   HEALTH: ['status', 'message'],
-  SCRAPE_START: ['message'],
+  SCRAPE_START: ['message', 'job_id'],
   STATUS: ['is_running', 'progress', 'message'],
   RESULTS: ['success', 'date', 'total_awards'],
   STOP: ['message']
 }
 
 const validateConfig = () => {
-  if (!API_BASE_URL) {
-    throw new Error('API_BASE_URL is required')
-  }
-  try {
-    new URL(API_BASE_URL)
-  } catch {
-    throw new Error('Invalid API_BASE_URL format')
-  }
+  if (!API_BASE_URL) throw new Error('API_BASE_URL is required')
+  try { new URL(API_BASE_URL) } catch { throw new Error('Invalid API_BASE_URL format') }
   if (IS_PRODUCTION && !API_KEY) {
     console.warn('⚠️ No API key configured for production environment')
   }

@@ -16,15 +16,19 @@ function App() {
   const [results, setResults] = useState(null)
   const [error, setError] = useState('')
   const [serverHealth, setServerHealth] = useState(null)
-  const [startedAt, setStartedAt] = useState(null)
+  const [jobId, setJobId] = useState(null)
 
-  useEffect(() => { checkServerHealth() }, [])
+  useEffect(() => {
+    checkServerHealth()
+  }, [])
 
   const checkServerHealth = async () => {
     try {
       const response = await apiService.checkHealth()
       setServerHealth(response)
-      if (!response.success) setError('Service is temporarily unavailable. Please try again later.')
+      if (!response.success) {
+        setError('Service is temporarily unavailable. Please try again later.')
+      }
     } catch (err) {
       setServerHealth({ success: false, error: err.message })
       setError('Unable to connect to service. Please check your internet connection.')
@@ -41,18 +45,20 @@ function App() {
       setLoading(true)
       setProgress(0)
       setProgressMessage('Initializing analysis...')
-      setStartedAt(null)
+      setJobId(null)
 
       const startResponse = await apiService.startScraping(date)
-      if (!startResponse.success) throw new Error(startResponse.error || 'Failed to start analysis')
-
+      if (!startResponse.success || !startResponse.jobId) {
+        throw new Error(startResponse.error || 'Failed to start analysis')
+      }
+      setJobId(startResponse.jobId)
       setProgressMessage('Analysis started successfully...')
 
       const finalResults = await apiService.pollScrapingProgress(
+        startResponse.jobId,
         (progressData) => {
           setProgress(progressData.progress || 0)
           setProgressMessage(progressData.message || 'Processing...')
-          if (progressData.started_at && !startedAt) setStartedAt(progressData.started_at)
           if (progressData.error) {
             setError(progressData.error)
             setAppState('error')
@@ -80,13 +86,14 @@ function App() {
 
   const handleCancel = async () => {
     try {
-      await apiService.stopScraping()
+      if (jobId) await apiService.stopScraping(jobId)
       setLoading(false)
       setAppState('idle')
       setProgress(0)
       setProgressMessage('')
       setError('')
-      setStartedAt(null)
+      setResults(null)
+      setJobId(null)
     } catch (err) {
       setError('Failed to cancel operation: ' + err.message)
     }
@@ -99,7 +106,7 @@ function App() {
     setProgress(0)
     setProgressMessage('')
     setLoading(false)
-    setStartedAt(null)
+    setJobId(null)
     checkServerHealth()
   }
 
@@ -112,7 +119,7 @@ function App() {
     setProgress(0)
     setProgressMessage('')
     setLoading(false)
-    setStartedAt(null)
+    setJobId(null)
   }
 
   return (
@@ -138,7 +145,6 @@ function App() {
           <LoadingSpinner
             progress={progress}
             message={progressMessage}
-            startedAt={startedAt}
             onCancel={handleCancel}
           />
         )}

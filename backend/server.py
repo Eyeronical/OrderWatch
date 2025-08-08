@@ -5,7 +5,8 @@ import time
 import logging
 import threading
 import hmac
-from datetime import datetime, timezone, date
+import uuid
+from datetime import datetime, timezone, date, timedelta
 from typing import List, Dict, Tuple, Optional
 from urllib.parse import urlparse
 from pathlib import Path
@@ -27,7 +28,6 @@ try:
 except Exception:
     HAS_PYPDF2 = False
 
-# pdfminer import
 try:
     from pdfminer.high_level import extract_text as pdfminer_extract_text
     HAS_PDFMINER = True
@@ -44,6 +44,7 @@ MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 API_KEY = os.getenv("API_KEY", "").strip()
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36"
 MIN_DATE = date(2010, 1, 1)
+JOB_TTL_MINUTES = int(os.getenv("JOB_TTL_MINUTES", "120"))  # auto-prune finished jobs after 2h
 
 def _parse_origins(origins: str):
     if origins.strip() == "*":
@@ -91,153 +92,45 @@ def _require_api_key():
     key = h or try_qs
     return bool(key) and hmac.compare_digest(key, API_KEY)
 
-class ScrapeManager:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._status = {
-            "is_running": False,
-            "progress": 0,
-            "message": "",
-            "results": None,
-            "error": None,
-            "total_announcements": 0,
-            "started_at": None,
-            "finished_at": None,
-        }
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
+# ----------------------- Visit persistence (unchanged) -----------------------
+_visits_lock = threading.Lock()
+VISITS_FILE = Path(os.getenv("VISITS_FILE", "data/visits.count"))
 
-    def get_status(self):
-        with self._lock:
-            return dict(self._status)
+def _ensure_visits_file():
+    try:
+        VISITS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not VISITS_FILE.exists():
+            VISITS_FILE.write_text("0")
+    except Exception as e:
+        logger.warning(f"Could not prepare visits file: {e}")
 
-    def get_results(self):
-        with self._lock:
-            return self._status.get("results")
+def _read_visits():
+    try:
+        return int(VISITS_FILE.read_text().strip())
+    except Exception:
+        return 0
 
-    def update_status(self, **kwargs):
-        with self._lock:
-            self._status.update(kwargs)
+def _write_visits(v: int):
+    try:
+        VISITS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        VISITS_FILE.write_text(str(v))
+    except Exception as e:
+        logger.warning(f"Could not write visits file: {e}")
 
-    def start(self, bse_formatted_date: str):
-        with self._lock:
-            if self._status["is_running"]:
-                raise RuntimeError("A scraping job is already running")
-            self._status.update(
-                {
-                    "is_running": True,
-                    "progress": 0,
-                    "message": "Starting...",
-                    "results": None,
-                    "error": None,
-                    "total_announcements": 0,
-                    "started_at": datetime.now(timezone.utc).isoformat(),
-                    "finished_at": None,
-                }
-            )
-            self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, args=(bse_formatted_date,), daemon=True, name="scraper-thread")
-        self._thread.start()
+_ensure_visits_file()
 
-    def stop(self):
-        self._stop_event.set()
-        with self._lock:
-            self._status["message"] = "Stop requested"
+@app.route("/api/visit", methods=["POST"])
+def visit_hit():
+    with _visits_lock:
+        v = _read_visits() + 1
+        _write_visits(v)
+        return jsonify({"visits": v}), 200
 
-    def _run(self, formatted_date: str):
-        driver = None
-        try:
-            self.update_status(progress=10, message="Setting up browser...")
-            driver = setup_driver(headless=HEADLESS)
-            driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-            self.update_status(progress=20, message="Opening BSE announcements page...")
-            safe_get(driver, "https://www.bseindia.com/corporates/ann.html", wait_css="body")
-            time.sleep(1)
-            if self._stop_event.is_set():
-                raise InterruptedError("Stopped by user")
-            self.update_status(progress=30, message=f"Setting date to {formatted_date}...")
-            from_ok = set_date_field(driver, "txtFromDt", formatted_date, "From Date")
-            to_ok = set_date_field(driver, "txtToDt", formatted_date, "To Date")
-            if not (from_ok and to_ok):
-                logger.warning("Date fields may not have been set correctly, continuing...")
-            self.update_status(progress=40, message="Submitting form...")
-            if not submit_form(driver):
-                raise RuntimeError("Failed to submit form")
-            self.update_status(progress=50, message="Waiting for results...")
-            WebDriverWait(driver, SELENIUM_WAIT).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
-            )
-            total_announcements = get_total_announcements(driver)
-            self.update_status(total_announcements=total_announcements)
-            self.update_status(progress=60, message="Scanning announcements for order wins...")
-            orders = handle_pagination_and_scrape(driver, stop_event=self._stop_event)
-            if self._stop_event.is_set():
-                raise InterruptedError("Stopped by user")
+@app.route("/api/visit", methods=["GET"])
+def visit_get():
+    return jsonify({"visits": _read_visits()}), 200
 
-            orders = dedupe_orders(orders)  # ensure counts match UI list
-
-            if orders:
-                orders.sort(key=lambda x: x.get("total_value_crores", 0), reverse=True)
-                total_value = round(sum(o.get("total_value_crores", 0) for o in orders), 2)
-                results = {
-                    "success": True,
-                    "date": formatted_date,
-                    "total_awards": len(orders),
-                    "total_value_crores": total_value,
-                    "total_announcements": total_announcements,
-                    "orders": orders,
-                    "statistics": {
-                        "high_value_count": sum(1 for o in orders if o.get("total_value_crores", 0) >= 100),
-                        "medium_value_count": sum(1 for o in orders if 10 <= o.get("total_value_crores", 0) < 100),
-                        "low_value_count": sum(1 for o in orders if 0 < o.get("total_value_crores", 0) < 10),
-                        "no_value_count": sum(1 for o in orders if o.get("total_value_crores", 0) == 0),
-                    },
-                }
-            else:
-                results = {
-                    "success": True,
-                    "date": formatted_date,
-                    "total_awards": 0,
-                    "total_value_crores": 0,
-                    "total_announcements": total_announcements,
-                    "orders": [],
-                    "message": "No order awards found for this date",
-                }
-            self.update_status(
-                is_running=False,
-                progress=100,
-                message="Scraping completed",
-                results=results,
-                error=None,
-                finished_at=datetime.now(timezone.utc).isoformat(),
-            )
-        except InterruptedError as ie:
-            logger.info(f"Scraper stopped: {ie}")
-            self.update_status(
-                is_running=False,
-                progress=0,
-                message="Scraping stopped by user",
-                error=str(ie),
-                finished_at=datetime.now(timezone.utc).isoformat(),
-            )
-        except Exception as e:
-            logger.exception("Scraping failed")
-            self.update_status(
-                is_running=False,
-                progress=0,
-                message="Scraping failed",
-                results=None,
-                error=str(e),
-                finished_at=datetime.now(timezone.utc).isoformat(),
-            )
-        finally:
-            try:
-                if driver:
-                    driver.quit()
-            except Exception:
-                pass
-
-scrape_manager = ScrapeManager()
+# ----------------------- Scraping logic -----------------------
 
 def setup_driver(headless: bool = True) -> webdriver.Chrome:
     opts = Options()
@@ -481,21 +374,6 @@ def clean_company_name(company: str, title: str) -> str:
     name = re.sub(r"\s*\([^)]*\)\s*$", "", name)
     return name.title() if name else ""
 
-def dedupe_orders(orders: List[Dict]) -> List[Dict]:
-    seen = set()
-    unique = []
-    for o in orders:
-        key = (
-            (o.get("company") or "").strip().lower(),
-            (o.get("title") or "").strip().lower(),
-            (o.get("pdf_link") or "").strip().lower()
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(o)
-    return unique
-
 def scrape_announcement_tables_on_page(driver: webdriver.Chrome, page_num: int, sink: List[Dict], stop_event: threading.Event) -> int:
     try:
         WebDriverWait(driver, SELENIUM_WAIT).until(
@@ -613,46 +491,220 @@ def handle_pagination_and_scrape(driver: webdriver.Chrome, stop_event: threading
         time.sleep(1)
     return orders
 
+# ----------------------- Multi-job manager -----------------------
+
+class ScrapeJob:
+    def __init__(self, job_id: str, formatted_date: str):
+        self.job_id = job_id
+        self.formatted_date = formatted_date
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.lock = threading.Lock()
+        self.status = {
+            "job_id": job_id,
+            "is_running": False,
+            "progress": 0,
+            "message": "",
+            "results": None,
+            "error": None,
+            "total_announcements": 0,
+            "started_at": None,
+            "finished_at": None,
+        }
+
+    def update(self, **kwargs):
+        with self.lock:
+            self.status.update(kwargs)
+
+    def get_status(self):
+        with self.lock:
+            return dict(self.status)
+
+    def run(self):
+        driver = None
+        try:
+            self.update(is_running=True, progress=10, message="Setting up browser...", started_at=datetime.now(timezone.utc).isoformat())
+            driver = setup_driver(headless=HEADLESS)
+            driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+
+            self.update(progress=20, message="Opening BSE announcements page...")
+            safe_get(driver, "https://www.bseindia.com/corporates/ann.html", wait_css="body")
+            time.sleep(1)
+            if self.stop_event.is_set():
+                raise InterruptedError("Stopped by user")
+
+            self.update(progress=30, message=f"Setting date to {self.formatted_date}...")
+            from_ok = set_date_field(driver, "txtFromDt", self.formatted_date, "From Date")
+            to_ok = set_date_field(driver, "txtToDt", self.formatted_date, "To Date")
+            if not (from_ok and to_ok):
+                logger.warning("Date fields may not have been set correctly, continuing...")
+
+            self.update(progress=40, message="Submitting form...")
+            if not submit_form(driver):
+                raise RuntimeError("Failed to submit form")
+
+            self.update(progress=50, message="Waiting for results...")
+            WebDriverWait(driver, SELENIUM_WAIT).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
+            )
+            total_announcements = get_total_announcements(driver)
+            self.update(total_announcements=total_announcements)
+
+            self.update(progress=60, message="Scanning announcements for order wins...")
+            orders = handle_pagination_and_scrape(driver, stop_event=self.stop_event)
+            if self.stop_event.is_set():
+                raise InterruptedError("Stopped by user")
+
+            # De-duplicate and finalize
+            orders = dedupe_orders(orders)
+            if orders:
+                orders.sort(key=lambda x: x.get("total_value_crores", 0), reverse=True)
+                total_value = round(sum(o.get("total_value_crores", 0) for o in orders), 2)
+                results = {
+                    "success": True,
+                    "date": self.formatted_date,
+                    "total_awards": len(orders),
+                    "total_value_crores": total_value,
+                    "total_announcements": total_announcements,
+                    "orders": orders,
+                    "statistics": {
+                        "high_value_count": sum(1 for o in orders if o.get("total_value_crores", 0) >= 100),
+                        "medium_value_count": sum(1 for o in orders if 10 <= o.get("total_value_crores", 0) < 100),
+                        "low_value_count": sum(1 for o in orders if 0 < o.get("total_value_crores", 0) < 10),
+                        "no_value_count": sum(1 for o in orders if o.get("total_value_crores", 0) == 0),
+                    },
+                }
+            else:
+                results = {
+                    "success": True,
+                    "date": self.formatted_date,
+                    "total_awards": 0,
+                    "total_value_crores": 0,
+                    "total_announcements": total_announcements,
+                    "orders": [],
+                    "message": "No order awards found for this date",
+                }
+
+            self.update(
+                is_running=False,
+                progress=100,
+                message="Scraping completed",
+                results=results,
+                error=None,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except InterruptedError as ie:
+            logger.info(f"[{self.job_id}] Scraper stopped: {ie}")
+            self.update(
+                is_running=False,
+                progress=0,
+                message="Scraping stopped by user",
+                error=str(ie),
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception as e:
+            logger.exception(f"[{self.job_id}] Scraping failed")
+            self.update(
+                is_running=False,
+                progress=0,
+                message="Scraping failed",
+                results=None,
+                error=str(e),
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+        finally:
+            try:
+                if driver:
+                    driver.quit()
+            except Exception:
+                pass
+
+    def start(self):
+        self.thread = threading.Thread(target=self.run, name=f"scraper-{self.job_id[:8]}", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self.update(message="Stop requested")
+
+def dedupe_orders(orders: List[Dict]) -> List[Dict]:
+    seen = set()
+    unique = []
+    for o in orders:
+        key = (
+            (o.get("company") or "").strip().lower(),
+            (o.get("title") or "").strip().lower(),
+            (o.get("pdf_link") or "").strip().lower()
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(o)
+    return unique
+
+class MultiScrapeManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs: Dict[str, ScrapeJob] = {}
+
+    def _cleanup(self):
+        # prune finished jobs older than TTL
+        now = datetime.now(timezone.utc)
+        to_delete = []
+        with self.lock:
+            for jid, job in self.jobs.items():
+                st = job.get_status()
+                if not st.get("finished_at"):
+                    continue
+                try:
+                    finished = datetime.fromisoformat(st["finished_at"])
+                except Exception:
+                    continue
+                if (now - finished) > timedelta(minutes=JOB_TTL_MINUTES):
+                    to_delete.append(jid)
+            for jid in to_delete:
+                self.jobs.pop(jid, None)
+
+    def start(self, formatted_date: str) -> str:
+        job_id = uuid.uuid4().hex
+        job = ScrapeJob(job_id, formatted_date)
+        with self.lock:
+            self.jobs[job_id] = job
+        job.start()
+        self._cleanup()
+        return job_id
+
+    def get(self, job_id: str) -> Optional[ScrapeJob]:
+        with self.lock:
+            return self.jobs.get(job_id)
+
+    def status(self, job_id: str):
+        job = self.get(job_id)
+        if not job:
+            return None
+        return job.get_status()
+
+    def results(self, job_id: str):
+        job = self.get(job_id)
+        if not job:
+            return None
+        st = job.get_status()
+        return st.get("results")
+
+    def stop(self, job_id: str):
+        job = self.get(job_id)
+        if not job:
+            return False
+        job.stop()
+        return True
+
+scrape_manager = MultiScrapeManager()
+
+# ----------------------- API endpoints -----------------------
+
 @app.route("/api/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy", "message": "BSE Scraper API is running", "timestamp": datetime.now(timezone.utc).isoformat()}), 200
-
-_visits_lock = threading.Lock()
-VISITS_FILE = Path(os.getenv("VISITS_FILE", "data/visits.count"))
-
-def _ensure_visits_file():
-    try:
-        VISITS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if not VISITS_FILE.exists():
-            VISITS_FILE.write_text("0")
-    except Exception as e:
-        logger.warning(f"Could not prepare visits file: {e}")
-
-def _read_visits():
-    try:
-        return int(VISITS_FILE.read_text().strip())
-    except Exception:
-        return 0
-
-def _write_visits(v: int):
-    try:
-        VISITS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        VISITS_FILE.write_text(str(v))
-    except Exception as e:
-        logger.warning(f"Could not write visits file: {e}")
-
-_ensure_visits_file()
-
-@app.route("/api/visit", methods=["POST"])
-def visit_hit():
-    with _visits_lock:
-        v = _read_visits() + 1
-        _write_visits(v)
-        return jsonify({"visits": v}), 200
-
-@app.route("/api/visit", methods=["GET"])
-def visit_get():
-    return jsonify({"visits": _read_visits()}), 200
 
 @app.route("/api/scrape", methods=["POST"])
 def start_scrape():
@@ -668,32 +720,46 @@ def start_scrape():
         formatted_date, date_obj = validate_date(payload["date"])
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+
     try:
-        scrape_manager.start(formatted_date)
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 409
+        job_id = scrape_manager.start(formatted_date)
     except Exception:
         logger.exception("Failed to start scraper")
         return jsonify({"error": "Failed to start scraping"}), 500
-    return jsonify({"message": "Scraping started", "date": formatted_date, "readable_date": date_obj.strftime("%A, %B %d, %Y")}), 202
+
+    return jsonify({
+        "message": "Scraping started",
+        "date": formatted_date,
+        "readable_date": date_obj.strftime("%B %d, %Y"),
+        "job_id": job_id
+    }), 202
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
     if not _require_api_key():
         return jsonify({"error": "Unauthorized"}), 401
-    return jsonify(scrape_manager.get_status()), 200
+    job_id = request.args.get("job_id", "").strip()
+    if not job_id:
+        return jsonify({"error": "job_id is required"}), 400
+    st = scrape_manager.status(job_id)
+    if not st:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(st), 200
 
 @app.route("/api/results", methods=["GET"])
 def get_results():
     if not _require_api_key():
         return jsonify({"error": "Unauthorized"}), 401
-    res = scrape_manager.get_results()
-    st = scrape_manager.get_status()
+    job_id = request.args.get("job_id", "").strip()
+    if not job_id:
+        return jsonify({"error": "job_id is required"}), 400
+    res = scrape_manager.results(job_id)
+    st = scrape_manager.status(job_id)
     if res:
         return jsonify(res), 200
-    if st.get("error"):
+    if st and st.get("error"):
         return jsonify({"error": st["error"]}), 500
-    if st.get("is_running"):
+    if st and st.get("is_running"):
         return jsonify({"message": "Scraping is in progress"}), 202
     return jsonify({"message": "No results available"}), 404
 
@@ -701,11 +767,17 @@ def get_results():
 def stop_scraping():
     if not _require_api_key():
         return jsonify({"error": "Unauthorized"}), 401
-    st = scrape_manager.get_status()
-    if not st.get("is_running"):
-        return jsonify({"message": "No scraping job is currently running"}), 200
-    scrape_manager.stop()
-    return jsonify({"message": "Stop requested"}), 202
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        payload = {}
+    job_id = (payload.get("job_id") or request.args.get("job_id") or "").strip()
+    if not job_id:
+        return jsonify({"error": "job_id is required"}), 400
+    ok = scrape_manager.stop(job_id)
+    if not ok:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify({"message": "Stop requested", "job_id": job_id}), 202
 
 @app.errorhandler(404)
 def not_found(error):
