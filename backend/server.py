@@ -1,15 +1,17 @@
 import os
 import re
 import io
+import json
 import time
-import logging
-import threading
 import hmac
 import uuid
+import logging
+import threading
 from datetime import datetime, timezone, date, timedelta
 from typing import List, Dict, Tuple, Optional
 from urllib.parse import urlparse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from flask import Flask, request, jsonify
@@ -18,10 +20,12 @@ from flask_cors import CORS
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
+# Optional PDF libraries
 try:
     import PyPDF2
     HAS_PYPDF2 = True
@@ -34,6 +38,7 @@ try:
 except Exception:
     HAS_PDFMINER = False
 
+# ----------------------- Configuration -----------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HEADLESS = os.getenv("HEADLESS", "1").lower() in ("1", "true", "yes")
 PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "90"))
@@ -42,17 +47,26 @@ PDF_TIMEOUT = int(os.getenv("PDF_TIMEOUT", "45"))
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 API_KEY = os.getenv("API_KEY", "").strip()
-UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36"
 MIN_DATE = date(2010, 1, 1)
-JOB_TTL_MINUTES = int(os.getenv("JOB_TTL_MINUTES", "120"))  # auto-prune finished jobs after 2h
+JOB_TTL_MINUTES = int(os.getenv("JOB_TTL_MINUTES", "120"))
+UA = os.getenv("SCRAPER_UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36")
+
+# Caching + performance
+CACHE_DIR = Path(os.getenv("CACHE_DIR", "data/cache"))
+CACHE_TTL_MINUTES = int(os.getenv("CACHE_TTL_MINUTES", "1440"))  # 24h
+PDF_WORKERS = int(os.getenv("PDF_WORKERS", "4"))
+
+# Visits counter persistence (optional)
+VISITS_FILE = Path(os.getenv("VISITS_FILE", "data/visits.count"))
+
+# ----------------------- Logging & Flask -----------------------
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s")
+logger = logging.getLogger("bse-scraper")
 
 def _parse_origins(origins: str):
     if origins.strip() == "*":
         return "*"
     return [o.strip() for o in origins.split(",") if o.strip()]
-
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s")
-logger = logging.getLogger("bse-scraper")
 
 app = Flask(__name__)
 CORS(
@@ -61,19 +75,11 @@ CORS(
         r"/api/*": {
             "origins": _parse_origins(ALLOWED_ORIGINS),
             "methods": ["GET", "POST", "OPTIONS"],
-            "allow_headers": [
-                "Content-Type",
-                "X-Requested-With",
-                "X-API-Key",
-                "Cache-Control",
-                "Pragma",
-                "Accept",
-                "Origin"
-            ],
+            "allow_headers": ["Content-Type", "X-Requested-With", "X-API-Key", "Cache-Control", "Pragma", "Accept", "Origin"],
             "expose_headers": ["Retry-After"],
-            "supports_credentials": False
+            "supports_credentials": False,
         }
-    }
+    },
 )
 
 @app.after_request
@@ -84,17 +90,16 @@ def add_security_headers(resp):
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0"
     return resp
 
-def _require_api_key():
+def _require_api_key() -> bool:
     if not API_KEY:
         return True
     h = request.headers.get("X-API-Key", "")
-    try_qs = request.args.get("api_key", "")
-    key = h or try_qs
+    qs = request.args.get("api_key", "")
+    key = h or qs
     return bool(key) and hmac.compare_digest(key, API_KEY)
 
-# ----------------------- Visit persistence (unchanged) -----------------------
+# ----------------------- Visit counter (optional) -----------------------
 _visits_lock = threading.Lock()
-VISITS_FILE = Path(os.getenv("VISITS_FILE", "data/visits.count"))
 
 def _ensure_visits_file():
     try:
@@ -130,8 +135,7 @@ def visit_hit():
 def visit_get():
     return jsonify({"visits": _read_visits()}), 200
 
-# ----------------------- Scraping logic -----------------------
-
+# ----------------------- Selenium helpers -----------------------
 def setup_driver(headless: bool = True) -> webdriver.Chrome:
     opts = Options()
     if headless:
@@ -200,17 +204,94 @@ def set_date_field(driver: webdriver.Chrome, field_id: str, date_value: str, lab
         logger.warning(f"Failed to set {label}: {e}")
         return False
 
+def accept_cookies_if_any(driver):
+    try:
+        xpaths = [
+            "//*[@id='onetrust-accept-btn-handler']",
+            "//*[@id='acceptCookie']",
+            "//button[contains(.,'Accept')]",
+            "//a[contains(.,'Accept')]",
+        ]
+        for xp in xpaths:
+            els = driver.find_elements(By.XPATH, xp)
+            if els:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", els[0])
+                time.sleep(0.2)
+                driver.execute_script("arguments[0].click();", els[0])
+                time.sleep(0.3)
+                return True
+    except Exception:
+        pass
+    return False
+
 def submit_form(driver: webdriver.Chrome) -> bool:
     try:
-        btn = WebDriverWait(driver, SELENIUM_WAIT).until(EC.element_to_be_clickable((By.ID, "btnSubmit")))
-        driver.execute_script("arguments[0].click();", btn)
-        time.sleep(2)
-        return True
+        candidates = [
+            (By.CSS_SELECTOR, "#btnSubmit"),
+            (By.CSS_SELECTOR, "#btnsubmit"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
+            (By.CSS_SELECTOR, "input[type='button'][value='Search']"),
+            (By.CSS_SELECTOR, "button#btnSearch"),
+            (By.XPATH, "//button[contains(.,'Search')]"),
+            (By.XPATH, "//input[@value='Search']"),
+        ]
+        button = None
+        for by, sel in candidates:
+            try:
+                button = WebDriverWait(driver, 5).until(EC.presence_of_element_located((by, sel)))
+                if button:
+                    break
+            except Exception:
+                continue
+
+        if button:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", button)
+            time.sleep(0.2)
+            try:
+                driver.execute_script("arguments[0].disabled=false;", button)
+            except Exception:
+                pass
+            driver.execute_script("""
+                const el = arguments[0];
+                ['mouseover','mousedown','mouseup','click'].forEach(ev =>
+                  el.dispatchEvent(new MouseEvent(ev, {bubbles:true, cancelable:true}))
+                );
+            """, button)
+            time.sleep(0.8)
+            return True
+
+        # Fallback: press Enter on To Date field
+        try:
+            to_el = driver.find_element(By.ID, "txtToDt")
+            to_el.send_keys(Keys.ENTER)
+            time.sleep(0.8)
+            return True
+        except Exception:
+            pass
+
+        return False
     except Exception as e:
         logger.error(f"Error submitting form: {e}")
         return False
 
+def wait_for_results_or_empty(driver: webdriver.Chrome, timeout: int = SELENIUM_WAIT) -> bool:
+    def condition(d):
+        if d.find_elements(By.CSS_SELECTOR, 'table[ng-repeat="cann in CorpannData.Table"]'):
+            return True
+        src = (d.page_source or "").lower()
+        if "no record" in src or "no records" in src:
+            return True
+        return False
+
+    try:
+        WebDriverWait(driver, timeout).until(condition)
+        return True
+    except Exception:
+        return False
+
+# ----------------------- Scraping utilities -----------------------
 def get_total_announcements(driver: webdriver.Chrome) -> int:
+    # Try a few selectors; fallback to scraping text
     try:
         el = WebDriverWait(driver, 5).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, ".col-lg-6.text-right.ng-binding b.ng-binding"))
@@ -257,6 +338,148 @@ def is_order_announcement(title: str, summary: str = "") -> bool:
         return True
     return any(k in hay for k in ORDER_KEYWORDS)
 
+def clean_company_name(company: str, title: str) -> str:
+    name = (company or "").strip()
+    if not name and title:
+        parts = title.split(" - ")
+        if parts:
+            name = parts[0].strip()
+    name = re.sub(r"\s*\([^)]*\)\s*$", "", name)
+    return name.title() if name else ""
+
+# Only collect; PDF analysis happens later in parallel
+def scrape_announcement_tables_on_page(driver: webdriver.Chrome, page_num: int, sink: List[Dict], stop_event: threading.Event) -> int:
+    try:
+        WebDriverWait(driver, SELENIUM_WAIT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'table[ng-repeat="cann in CorpannData.Table"]'))
+        )
+    except TimeoutException:
+        return 0
+
+    tables = driver.find_elements(By.CSS_SELECTOR, 'table[ng-repeat="cann in CorpannData.Table"]')
+    count = 0
+    for idx, table in enumerate(tables, 1):
+        if stop_event.is_set():
+            break
+        try:
+            rows = table.find_elements(By.TAG_NAME, "tr")
+            first_cells = rows[0].find_elements(By.TAG_NAME, "td") if rows else []
+            company = first_cells[0].text.strip() if first_cells else ""
+
+            title = ""
+            try:
+                title_span = table.find_element(By.CSS_SELECTOR, "span[ng-bind-html='cann.NEWSSUB']")
+                title = title_span.text.strip()
+            except Exception:
+                if first_cells and len(first_cells) > 1:
+                    title = first_cells[1].text.strip()
+                if not title:
+                    for sp in table.find_elements(By.TAG_NAME, "span"):
+                        t = sp.text.strip()
+                        if "Announcement under Regulation 30" in t or "Order" in t or "Contract" in t:
+                            title = t
+                            break
+
+            summary = ""
+            try:
+                for r in rows[1:]:
+                    txt = r.text.strip()
+                    if txt and txt != title and len(txt) > 10:
+                        summary = txt
+                        break
+            except Exception:
+                pass
+
+            if not is_order_announcement(title, summary):
+                continue
+
+            pdf_link = None
+            try:
+                for a in table.find_elements(By.TAG_NAME, "a"):
+                    href = (a.get_attribute("href") or "").strip()
+                    if ".pdf" in href.lower() or "download" in href.lower():
+                        pdf_link = ("https://www.bseindia.com" + href) if href.startswith("/") else href
+                        break
+            except Exception:
+                pass
+
+            sink.append({
+                "page": page_num,
+                "announcement_num": idx,
+                "company": clean_company_name(company, title),
+                "raw_company": company,
+                "title": title,
+                "summary": summary or "No summary available",
+                "pdf_link": pdf_link or "No PDF available",
+                "order_values": [],
+                "total_value_crores": 0.0,
+                "pdf_extract": "Not parsed",
+            })
+            count += 1
+        except Exception as e:
+            logger.debug(f"Error processing announcement {idx}: {e}")
+            continue
+    return count
+
+def click_next_if_available(driver: webdriver.Chrome) -> bool:
+    # Attempts to click the "Next" pagination button if present
+    candidates = [
+        (By.ID, "idnext"),
+        (By.CSS_SELECTOR, "#idnext"),
+        (By.XPATH, "//a[contains(.,'Next')]"),
+        (By.CSS_SELECTOR, "button.next, a.next"),
+    ]
+    for by, sel in candidates:
+        try:
+            next_btn = WebDriverWait(driver, 5).until(EC.presence_of_element_located((by, sel)))
+        except TimeoutException:
+            continue
+        try:
+            if not next_btn.is_displayed():
+                continue
+            cls = (next_btn.get_attribute("class") or "").lower()
+            if "disabled" in cls or "ng-hide" in cls:
+                continue
+            driver.execute_script("arguments[0].click();", next_btn)
+            time.sleep(1.2)
+            return True
+        except Exception:
+            continue
+    return False
+
+def handle_pagination_and_scrape(driver: webdriver.Chrome, stop_event: threading.Event) -> List[Dict]:
+    page_num = 1
+    orders: List[Dict] = []
+    while True:
+        if stop_event.is_set():
+            break
+        scrape_announcement_tables_on_page(driver, page_num, orders, stop_event)
+        if stop_event.is_set():
+            break
+        moved = click_next_if_available(driver)
+        if not moved:
+            break
+        try:
+            WebDriverWait(driver, SELENIUM_WAIT).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'table[ng-repeat="cann in CorpannData.Table"]'))
+            )
+        except TimeoutException:
+            break
+        page_num += 1
+        time.sleep(0.8)
+    return orders
+
+# ----------------------- PDF utilities -----------------------
+def _is_allowed_pdf_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "https":
+            return False
+        host = parsed.hostname or ""
+        return host.endswith("bseindia.com")
+    except Exception:
+        return False
+
 def extract_pdf_text(content: bytes) -> str:
     if HAS_PYPDF2:
         try:
@@ -278,39 +501,6 @@ def extract_pdf_text(content: bytes) -> str:
         except Exception as e:
             logger.debug(f"pdfminer failed: {e}")
     return ""
-
-def _is_allowed_pdf_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme != "https":
-            return False
-        host = parsed.hostname or ""
-        if host.endswith("bseindia.com"):
-            return True
-        return False
-    except Exception:
-        return False
-
-def fetch_pdf_and_extract_values(pdf_url: str) -> Tuple[List[Dict], str]:
-    if not _is_allowed_pdf_url(pdf_url):
-        return [], "PDF URL not allowed"
-    try:
-        headers = {"User-Agent": UA}
-        head = requests.head(pdf_url, headers=headers, timeout=PDF_TIMEOUT, allow_redirects=True)
-        clen = int(head.headers.get("Content-Length", "0")) if head.ok else 0
-        if clen and clen > MAX_PDF_BYTES:
-            return [], "PDF too large to process"
-        r = requests.get(pdf_url, headers=headers, timeout=PDF_TIMEOUT)
-        r.raise_for_status()
-        if len(r.content) > MAX_PDF_BYTES:
-            return [], "PDF too large to process"
-        text = extract_pdf_text(r.content)
-        values = extract_order_value_from_text(text)
-        snippet = (text or "")[:500]
-        return values, snippet if snippet else "No text extracted from PDF"
-    except Exception as e:
-        logger.warning(f"PDF extraction failed: {str(e)[:120]}")
-        return [], "PDF extraction failed"
 
 def extract_order_value_from_text(text: str) -> List[Dict]:
     patterns = [
@@ -336,6 +526,7 @@ def extract_order_value_from_text(text: str) -> List[Dict]:
         if u in ("billion", "bn", "b"):
             return value * 100.0
         return 0.0
+
     found = []
     lower = (text or "").lower()
     for pat in patterns:
@@ -346,16 +537,15 @@ def extract_order_value_from_text(text: str) -> List[Dict]:
                 crores = to_crores(value, unit)
                 if crores <= 0:
                     continue
-                found.append(
-                    {
-                        "value": value,
-                        "unit": unit.lower(),
-                        "formatted": f"₹{value:,.2f} {unit}",
-                        "value_in_crores": round(crores, 4),
-                    }
-                )
+                found.append({
+                    "value": value,
+                    "unit": unit.lower(),
+                    "formatted": f"₹{value:,.2f} {unit}",
+                    "value_in_crores": round(crores, 4),
+                })
             except Exception:
                 continue
+    # de-dupe by (value, unit)
     dedup = []
     seen = set()
     for item in found:
@@ -365,134 +555,110 @@ def extract_order_value_from_text(text: str) -> List[Dict]:
             dedup.append(item)
     return dedup
 
-def clean_company_name(company: str, title: str) -> str:
-    name = (company or "").strip()
-    if not name and title:
-        parts = title.split(" - ")
-        if parts:
-            name = parts[0].strip()
-    name = re.sub(r"\s*\([^)]*\)\s*$", "", name)
-    return name.title() if name else ""
-
-def scrape_announcement_tables_on_page(driver: webdriver.Chrome, page_num: int, sink: List[Dict], stop_event: threading.Event) -> int:
+def fetch_pdf_and_extract_values(pdf_url: str) -> Tuple[List[Dict], str]:
+    if not _is_allowed_pdf_url(pdf_url):
+        return [], "PDF URL not allowed"
     try:
-        WebDriverWait(driver, SELENIUM_WAIT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
+        headers = {"User-Agent": UA}
+        head = requests.head(pdf_url, headers=headers, timeout=PDF_TIMEOUT, allow_redirects=True)
+        clen = int(head.headers.get("Content-Length", "0")) if head.ok else 0
+        if clen and clen > MAX_PDF_BYTES:
+            return [], "PDF too large to process"
+        r = requests.get(pdf_url, headers=headers, timeout=PDF_TIMEOUT)
+        r.raise_for_status()
+        if len(r.content) > MAX_PDF_BYTES:
+            return [], "PDF too large to process"
+        text = extract_pdf_text(r.content)
+        values = extract_order_value_from_text(text)
+        snippet = (text or "")[:500]
+        return values, snippet if snippet else "No text extracted from PDF"
+    except Exception as e:
+        logger.warning(f"PDF extraction failed: {str(e)[:120]}")
+        return [], "PDF extraction failed"
+
+def enrich_orders_with_pdfs(orders: List[Dict]):
+    def work(idx, url):
+        try:
+            values, snippet = fetch_pdf_and_extract_values(url)
+        except Exception:
+            values, snippet = [], "PDF extraction failed"
+        total_crores = round(sum(v.get("value_in_crores", 0) for v in values), 2)
+        return idx, values, total_crores, (snippet or "")[:500]
+
+    futures = {}
+    with ThreadPoolExecutor(max_workers=PDF_WORKERS) as ex:
+        for i, o in enumerate(orders):
+            url = o.get("pdf_link")
+            if url and url != "No PDF available" and _is_allowed_pdf_url(url):
+                futures[ex.submit(work, i, url)] = i
+        for fut in as_completed(futures):
+            idx, values, total, snippet = fut.result()
+            orders[idx]["order_values"] = values
+            orders[idx]["total_value_crores"] = total
+            orders[idx]["pdf_extract"] = snippet
+
+# ----------------------- De-duplication -----------------------
+def dedupe_orders(orders: List[Dict]) -> List[Dict]:
+    seen = set()
+    unique = []
+    for o in orders:
+        key = (
+            (o.get("company") or "").strip().lower(),
+            (o.get("title") or "").strip().lower(),
+            (o.get("pdf_link") or "").strip().lower(),
         )
-    except TimeoutException:
-        return 0
-    tables = driver.find_elements(By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']")
-    count = 0
-    for idx, table in enumerate(tables, 1):
-        if stop_event.is_set():
-            break
-        try:
-            rows = table.find_elements(By.TAG_NAME, "tr")
-            first_cells = rows[0].find_elements(By.TAG_NAME, "td") if rows else []
-            company = first_cells[0].text.strip() if first_cells else ""
-            title = ""
-            try:
-                title_span = table.find_element(By.CSS_SELECTOR, "span[ng-bind-html='cann.NEWSSUB']")
-                title = title_span.text.strip()
-            except Exception:
-                if first_cells and len(first_cells) > 1:
-                    title = first_cells[1].text.strip()
-                if not title:
-                    try:
-                        for sp in table.find_elements(By.TAG_NAME, "span"):
-                            t = sp.text.strip()
-                            if "Announcement under Regulation 30" in t or "Order" in t or "Contract" in t:
-                                title = t
-                                break
-                    except Exception:
-                        pass
-            summary = ""
-            try:
-                for r in rows[1:]:
-                    txt = r.text.strip()
-                    if txt and txt != title and len(txt) > 10:
-                        summary = txt
-                        break
-            except Exception:
-                pass
-            if not is_order_announcement(title, summary):
-                continue
-            pdf_link = None
-            try:
-                for a in table.find_elements(By.TAG_NAME, "a"):
-                    href = (a.get_attribute("href") or "").strip()
-                    if ".pdf" in href.lower() or "download" in href.lower():
-                        pdf_link = ("https://www.bseindia.com" + href) if href.startswith("/") else href
-                        break
-            except Exception:
-                pass
-            order_values: List[Dict] = []
-            pdf_extract = "PDF not available"
-            total_crores = 0.0
-            if pdf_link and _is_allowed_pdf_url(pdf_link):
-                order_values, pdf_extract = fetch_pdf_and_extract_values(pdf_link)
-                total_crores = round(sum(v.get("value_in_crores", 0) for v in order_values), 4)
-            sink.append(
-                {
-                    "page": page_num,
-                    "announcement_num": idx,
-                    "company": clean_company_name(company, title),
-                    "raw_company": company,
-                    "title": title,
-                    "summary": summary or "No summary available",
-                    "pdf_link": pdf_link or "No PDF available",
-                    "order_values": order_values,
-                    "total_value_crores": round(total_crores, 2),
-                    "pdf_extract": (pdf_extract or "")[:500],
-                }
-            )
-            count += 1
-        except Exception as e:
-            logger.debug(f"Error processing announcement {idx}: {e}")
+        if key in seen:
             continue
-    return count
+        seen.add(key)
+        unique.append(o)
+    return unique
 
-def click_next_if_available(driver: webdriver.Chrome) -> bool:
+# ----------------------- Caching layer -----------------------
+_mem_cache: Dict[str, Tuple[datetime, Dict]] = {}
+_mem_cache_ttl = timedelta(minutes=CACHE_TTL_MINUTES)
+
+def _cache_path(formatted_date: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    safe = formatted_date.replace("/", "-")
+    return CACHE_DIR / f"{safe}.json"
+
+def cache_load(formatted_date: str) -> Optional[Dict]:
+    now = datetime.now(timezone.utc)
+    # memory
+    entry = _mem_cache.get(formatted_date)
+    if entry:
+        ts, data = entry
+        if now - ts <= _mem_cache_ttl:
+            return data
+        else:
+            _mem_cache.pop(formatted_date, None)
+    # disk
+    path = _cache_path(formatted_date)
+    if not path.exists():
+        return None
     try:
-        next_btn = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.ID, "idnext")))
-    except TimeoutException:
-        return False
+        age = now - datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        if age > _mem_cache_ttl:
+            return None
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        _mem_cache[formatted_date] = (now, data)
+        return data
+    except Exception as e:
+        logger.debug(f"Cache load failed for {formatted_date}: {e}")
+        return None
+
+def cache_save(formatted_date: str, data: Dict):
     try:
-        if not next_btn.is_displayed():
-            return False
-        cls = (next_btn.get_attribute("class") or "").lower()
-        if "disabled" in cls or "ng-hide" in cls:
-            return False
-        driver.execute_script("arguments[0].click();", next_btn)
-        time.sleep(1.5)
-        return True
-    except Exception:
-        return False
+        now = datetime.now(timezone.utc)
+        _mem_cache[formatted_date] = (now, data)
+        path = _cache_path(formatted_date)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.debug(f"Cache save failed for {formatted_date}: {e}")
 
-def handle_pagination_and_scrape(driver: webdriver.Chrome, stop_event: threading.Event) -> List[Dict]:
-    page_num = 1
-    orders: List[Dict] = []
-    while True:
-        if stop_event.is_set():
-            break
-        scrape_announcement_tables_on_page(driver, page_num, orders, stop_event)
-        if stop_event.is_set():
-            break
-        moved = click_next_if_available(driver)
-        if not moved:
-            break
-        try:
-            WebDriverWait(driver, SELENIUM_WAIT).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
-            )
-        except TimeoutException:
-            break
-        page_num += 1
-        time.sleep(1)
-    return orders
-
-# ----------------------- Multi-job manager -----------------------
-
+# ----------------------- Job management -----------------------
 class ScrapeJob:
     def __init__(self, job_id: str, formatted_date: str):
         self.job_id = job_id
@@ -520,16 +686,40 @@ class ScrapeJob:
         with self.lock:
             return dict(self.status)
 
+    def start(self):
+        self.thread = threading.Thread(target=self.run, name=f"scraper-{self.job_id[:8]}", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        self.update(message="Stop requested")
+
     def run(self):
         driver = None
         try:
+            # Serve from cache if available
+            cached = cache_load(self.formatted_date)
+            if cached:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                self.update(
+                    is_running=False,
+                    progress=100,
+                    message="Served from cache",
+                    results=cached,
+                    error=None,
+                    started_at=now_iso,
+                    finished_at=now_iso,
+                )
+                return
+
             self.update(is_running=True, progress=10, message="Setting up browser...", started_at=datetime.now(timezone.utc).isoformat())
             driver = setup_driver(headless=HEADLESS)
             driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
 
             self.update(progress=20, message="Opening BSE announcements page...")
             safe_get(driver, "https://www.bseindia.com/corporates/ann.html", wait_css="body")
-            time.sleep(1)
+            accept_cookies_if_any(driver)
+            time.sleep(0.5)
             if self.stop_event.is_set():
                 raise InterruptedError("Stopped by user")
 
@@ -544,9 +734,17 @@ class ScrapeJob:
                 raise RuntimeError("Failed to submit form")
 
             self.update(progress=50, message="Waiting for results...")
-            WebDriverWait(driver, SELENIUM_WAIT).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "table[ng-repeat='cann in CorpannData.Table']"))
-            )
+            if not wait_for_results_or_empty(driver, timeout=max(SELENIUM_WAIT, 25)):
+                # gentle fallback - send Enter again
+                try:
+                    el = driver.find_element(By.ID, "txtToDt")
+                    el.send_keys(Keys.ENTER)
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+                if not wait_for_results_or_empty(driver, timeout=15):
+                    raise RuntimeError("Failed to load results")
+
             total_announcements = get_total_announcements(driver)
             self.update(total_announcements=total_announcements)
 
@@ -555,8 +753,13 @@ class ScrapeJob:
             if self.stop_event.is_set():
                 raise InterruptedError("Stopped by user")
 
-            # De-duplicate and finalize
             orders = dedupe_orders(orders)
+
+            if orders:
+                self.update(progress=75, message="Analyzing PDFs for order values...")
+                enrich_orders_with_pdfs(orders)
+
+            # Finalize results
             if orders:
                 orders.sort(key=lambda x: x.get("total_value_crores", 0), reverse=True)
                 total_value = round(sum(o.get("total_value_crores", 0) for o in orders), 2)
@@ -585,6 +788,8 @@ class ScrapeJob:
                     "message": "No order awards found for this date",
                 }
 
+            # Cache and finish
+            cache_save(self.formatted_date, results)
             self.update(
                 is_running=False,
                 progress=100,
@@ -619,36 +824,12 @@ class ScrapeJob:
             except Exception:
                 pass
 
-    def start(self):
-        self.thread = threading.Thread(target=self.run, name=f"scraper-{self.job_id[:8]}", daemon=True)
-        self.thread.start()
-
-    def stop(self):
-        self.stop_event.set()
-        self.update(message="Stop requested")
-
-def dedupe_orders(orders: List[Dict]) -> List[Dict]:
-    seen = set()
-    unique = []
-    for o in orders:
-        key = (
-            (o.get("company") or "").strip().lower(),
-            (o.get("title") or "").strip().lower(),
-            (o.get("pdf_link") or "").strip().lower()
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(o)
-    return unique
-
 class MultiScrapeManager:
     def __init__(self):
         self.lock = threading.Lock()
         self.jobs: Dict[str, ScrapeJob] = {}
 
     def _cleanup(self):
-        # prune finished jobs older than TTL
         now = datetime.now(timezone.utc)
         to_delete = []
         with self.lock:
@@ -701,10 +882,13 @@ class MultiScrapeManager:
 scrape_manager = MultiScrapeManager()
 
 # ----------------------- API endpoints -----------------------
-
 @app.route("/api/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "healthy", "message": "BSE Scraper API is running", "timestamp": datetime.now(timezone.utc).isoformat()}), 200
+    return jsonify({
+        "status": "healthy",
+        "message": "BSE Scraper API is running",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }), 200
 
 @app.route("/api/scrape", methods=["POST"])
 def start_scrape():
@@ -720,6 +904,30 @@ def start_scrape():
         formatted_date, date_obj = validate_date(payload["date"])
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+
+    # If cached, short-circuit by creating a job that instantly returns cache (keeps API consistent)
+    cached = cache_load(formatted_date)
+    if cached:
+        job_id = uuid.uuid4().hex
+        job = ScrapeJob(job_id, formatted_date)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        job.update(
+            is_running=False,
+            progress=100,
+            message="Served from cache",
+            results=cached,
+            error=None,
+            started_at=now_iso,
+            finished_at=now_iso,
+        )
+        with scrape_manager.lock:
+            scrape_manager.jobs[job_id] = job
+        return jsonify({
+            "message": "Scraping started (cache hit)",
+            "date": formatted_date,
+            "readable_date": date_obj.strftime("%B %d, %Y"),
+            "job_id": job_id
+        }), 202
 
     try:
         job_id = scrape_manager.start(formatted_date)
@@ -779,6 +987,7 @@ def stop_scraping():
         return jsonify({"error": "Job not found"}), 404
     return jsonify({"message": "Stop requested", "job_id": job_id}), 202
 
+# ----------------------- Error handlers -----------------------
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": "Endpoint not found"}), 404
@@ -788,5 +997,6 @@ def internal_error(error):
     logger.exception("Unhandled server error")
     return jsonify({"error": "Internal server error"}), 500
 
+# ----------------------- Entry point -----------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5001")), debug=False)
