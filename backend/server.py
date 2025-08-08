@@ -21,9 +21,19 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.keys import Keys
+
+# We won’t rely on WebDriverWait timeouts; we’ll poll without hard time caps
+# But import remains available if you want to reintroduce timeouts later
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+SCRAPER_TZ = os.getenv("SCRAPER_TZ", "Asia/Kolkata")
 
 # Optional PDF libraries
 try:
@@ -41,19 +51,19 @@ except Exception:
 # ----------------------- Configuration -----------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HEADLESS = os.getenv("HEADLESS", "1").lower() in ("1", "true", "yes")
-PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "90"))
-SELENIUM_WAIT = int(os.getenv("SELENIUM_WAIT", "25"))
-PDF_TIMEOUT = int(os.getenv("PDF_TIMEOUT", "45"))
+PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "90"))  # kept, but not enforced
+SELENIUM_WAIT = int(os.getenv("SELENIUM_WAIT", "25"))          # kept for compatibility
+PDF_TIMEOUT = int(os.getenv("PDF_TIMEOUT", "45"))              # kept, but not enforced
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 API_KEY = os.getenv("API_KEY", "").strip()
 MIN_DATE = date(2010, 1, 1)
-JOB_TTL_MINUTES = int(os.getenv("JOB_TTL_MINUTES", "120"))
+JOB_TTL_MINUTES = int(os.getenv("JOB_TTL_MINUTES", "120"))     # kept, but not enforced for cleanup
 UA = os.getenv("SCRAPER_UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36")
 
 # Caching + performance
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "data/cache"))
-CACHE_TTL_MINUTES = int(os.getenv("CACHE_TTL_MINUTES", "1440"))  # 24h
+CACHE_TTL_MINUTES = int(os.getenv("CACHE_TTL_MINUTES", "1440"))  # still used for in-memory only
 PDF_WORKERS = int(os.getenv("PDF_WORKERS", "4"))
 
 # Visits counter persistence (optional)
@@ -152,9 +162,20 @@ def visit_get():
     return jsonify({"visits": _read_visits()}), 200
 
 # ----------------------- Storage helpers (TXT index + PDF cache) -----------------------
+_dates_index_lock = threading.Lock()
+
+def _now_in_config_tz() -> datetime:
+    if ZoneInfo:
+        try:
+            return datetime.now(ZoneInfo(SCRAPER_TZ))
+        except Exception:
+            pass
+    # Fallback to IST offset if tz not available/invalid
+    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+
 def is_today_formatted(formatted_date: str) -> bool:
     try:
-        return formatted_date == date.today().strftime("%d/%m/%Y")
+        return formatted_date == _now_in_config_tz().date().strftime("%d/%m/%Y")
     except Exception:
         return False
 
@@ -168,11 +189,12 @@ def _dates_index_load() -> set:
 
 def _dates_index_add(formatted_date: str):
     try:
-        DATES_STORE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        existing = _dates_index_load()
-        if formatted_date not in existing:
-            with DATES_STORE_FILE.open("a", encoding="utf-8") as f:
-                f.write(formatted_date + "\n")
+        with _dates_index_lock:
+            DATES_STORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            existing = _dates_index_load()
+            if formatted_date not in existing:
+                with DATES_STORE_FILE.open("a", encoding="utf-8") as f:
+                    f.write(formatted_date + "\n")
     except Exception as e:
         logger.debug(f"Failed to update date index: {e}")
 
@@ -246,18 +268,26 @@ def setup_driver(headless: bool = True) -> webdriver.Chrome:
         except Exception as e:
             logger.debug(f"CDP block setup failed: {e}")
 
-    driver.set_script_timeout(60)
+    # Do not set script or page load timeouts (to avoid premature closes)
     return driver
 
-def safe_get(driver: webdriver.Chrome, url: str, wait_css: str = "body", wait_timeout: int = SELENIUM_WAIT):
-    try:
-        driver.get(url)
-    except TimeoutException:
+def _wait_until_css(driver: webdriver.Chrome, css: str):
+    # Poll until selector appears (no hard timeout)
+    while True:
         try:
-            driver.execute_script("window.stop();")
+            if driver.find_elements(By.CSS_SELECTOR, css):
+                return
         except Exception:
             pass
-    WebDriverWait(driver, wait_timeout).until(EC.presence_of_element_located((By.CSS_SELECTOR, wait_css)))
+        time.sleep(0.25)
+
+def safe_get(driver: webdriver.Chrome, url: str, wait_css: str = "body"):
+    try:
+        driver.get(url)
+    except Exception:
+        # Ignore and continue to polling
+        pass
+    _wait_until_css(driver, wait_css)
 
 def validate_date(date_str: str) -> Tuple[str, datetime]:
     try:
@@ -265,7 +295,7 @@ def validate_date(date_str: str) -> Tuple[str, datetime]:
     except ValueError:
         raise ValueError("Invalid date format. Expected YYYY-MM-DD")
     d_only = dt.date()
-    if d_only > date.today():
+    if d_only > _now_in_config_tz().date():
         raise ValueError("Date cannot be in the future")
     if d_only < MIN_DATE:
         raise ValueError("Date cannot be before 2010-01-01")
@@ -273,7 +303,13 @@ def validate_date(date_str: str) -> Tuple[str, datetime]:
 
 def set_date_field(driver: webdriver.Chrome, field_id: str, date_value: str, label: str) -> bool:
     try:
-        el = WebDriverWait(driver, SELENIUM_WAIT).until(EC.presence_of_element_located((By.ID, field_id)))
+        # Poll element without timeout expiry
+        while True:
+            els = driver.find_elements(By.ID, field_id)
+            if els:
+                el = els[0]
+                break
+            time.sleep(0.2)
         driver.execute_script("arguments[0].removeAttribute('readonly');", el)
         driver.execute_script("arguments[0].value='';", el)
         driver.execute_script("arguments[0].value=arguments[1];", el, date_value)
@@ -322,12 +358,10 @@ def submit_form(driver: webdriver.Chrome) -> bool:
         ]
         button = None
         for by, sel in candidates:
-            try:
-                button = WebDriverWait(driver, 5).until(EC.presence_of_element_located((by, sel)))
-                if button:
-                    break
-            except Exception:
-                continue
+            els = driver.find_elements(by, sel)
+            if els:
+                button = els[0]
+                break
 
         if button:
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", button)
@@ -347,10 +381,11 @@ def submit_form(driver: webdriver.Chrome) -> bool:
 
         # Fallback: press Enter on To Date field
         try:
-            to_el = driver.find_element(By.ID, "txtToDt")
-            to_el.send_keys(Keys.ENTER)
-            time.sleep(0.8)
-            return True
+            to_els = driver.find_elements(By.ID, "txtToDt")
+            if to_els:
+                to_els[0].send_keys(Keys.ENTER)
+                time.sleep(0.8)
+                return True
         except Exception:
             pass
 
@@ -359,32 +394,28 @@ def submit_form(driver: webdriver.Chrome) -> bool:
         logger.error(f"Error submitting form: {e}")
         return False
 
-def wait_for_results_or_empty(driver: webdriver.Chrome, timeout: int = SELENIUM_WAIT) -> bool:
-    def condition(d):
-        if d.find_elements(By.CSS_SELECTOR, 'table[ng-repeat="cann in CorpannData.Table"]'):
-            return True
-        src = (d.page_source or "").lower()
-        if "no record" in src or "no records" in src:
-            return True
-        return False
-
-    try:
-        WebDriverWait(driver, timeout).until(condition)
-        return True
-    except Exception:
-        return False
+def wait_for_results_or_empty(driver: webdriver.Chrome) -> bool:
+    # Poll until either results table appears or page contains 'no records'
+    while True:
+        try:
+            if driver.find_elements(By.CSS_SELECTOR, 'table[ng-repeat="cann in CorpannData.Table"]'):
+                return True
+            src = (driver.page_source or "").lower()
+            if "no record" in src or "no records" in src:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.3)
 
 # ----------------------- Scraping utilities -----------------------
 def get_total_announcements(driver: webdriver.Chrome) -> int:
-    # Try a few selectors; fallback to scraping text
     try:
-        el = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".col-lg-6.text-right.ng-binding b.ng-binding"))
-        )
-        txt = el.text.strip()
-        nums = re.findall(r"\d+", txt)
-        if nums:
-            return int(nums[0])
+        els = driver.find_elements(By.CSS_SELECTOR, ".col-lg-6.text-right.ng-binding b.ng-binding")
+        if els:
+            txt = els[0].text.strip()
+            nums = re.findall(r"\d+", txt)
+            if nums:
+                return int(nums[0])
     except Exception:
         pass
     try:
@@ -435,10 +466,8 @@ def clean_company_name(company: str, title: str) -> str:
 # Only collect; PDF analysis happens later in parallel
 def scrape_announcement_tables_on_page(driver: webdriver.Chrome, page_num: int, sink: List[Dict], stop_event: threading.Event) -> int:
     try:
-        WebDriverWait(driver, SELENIUM_WAIT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'table[ng-repeat="cann in CorpannData.Table"]'))
-        )
-    except TimeoutException:
+        _wait_until_css(driver, 'table[ng-repeat="cann in CorpannData.Table"]')
+    except Exception:
         return 0
 
     tables = driver.find_elements(By.CSS_SELECTOR, 'table[ng-repeat="cann in CorpannData.Table"]')
@@ -507,7 +536,6 @@ def scrape_announcement_tables_on_page(driver: webdriver.Chrome, page_num: int, 
     return count
 
 def click_next_if_available(driver: webdriver.Chrome) -> bool:
-    # Attempts to click the "Next" pagination button if present
     candidates = [
         (By.ID, "idnext"),
         (By.CSS_SELECTOR, "#idnext"),
@@ -516,17 +544,17 @@ def click_next_if_available(driver: webdriver.Chrome) -> bool:
     ]
     for by, sel in candidates:
         try:
-            next_btn = WebDriverWait(driver, 5).until(EC.presence_of_element_located((by, sel)))
-        except TimeoutException:
-            continue
-        try:
+            els = driver.find_elements(by, sel)
+            if not els:
+                continue
+            next_btn = els[0]
             if not next_btn.is_displayed():
                 continue
             cls = (next_btn.get_attribute("class") or "").lower()
             if "disabled" in cls or "ng-hide" in cls:
                 continue
             driver.execute_script("arguments[0].click();", next_btn)
-            time.sleep(1.2)
+            time.sleep(1.0)
             return True
         except Exception:
             continue
@@ -544,14 +572,9 @@ def handle_pagination_and_scrape(driver: webdriver.Chrome, stop_event: threading
         moved = click_next_if_available(driver)
         if not moved:
             break
-        try:
-            WebDriverWait(driver, SELENIUM_WAIT).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, 'table[ng-repeat="cann in CorpannData.Table"]'))
-            )
-        except TimeoutException:
-            break
+        # small wait for next page to render
+        time.sleep(0.5)
         page_num += 1
-        time.sleep(0.4)  # reduced from 0.8 for speed
     return orders
 
 # ----------------------- PDF utilities -----------------------
@@ -651,12 +674,16 @@ def fetch_pdf_and_extract_values(pdf_url: str) -> Tuple[List[Dict], str]:
 
     try:
         headers = {"User-Agent": UA}
-        head = SESSION.head(pdf_url, headers=headers, timeout=PDF_TIMEOUT, allow_redirects=True)
-        clen = int(head.headers.get("Content-Length", "0")) if head.ok else 0
-        if clen and clen > MAX_PDF_BYTES:
-            return [], "PDF too large to process"
+        # No timeouts (per request), but keep size protection
+        try:
+            head = SESSION.head(pdf_url, headers=headers, allow_redirects=True)
+            clen = int(head.headers.get("Content-Length", "0")) if head.ok else 0
+            if clen and clen > MAX_PDF_BYTES:
+                return [], "PDF too large to process"
+        except Exception:
+            pass
 
-        r = SESSION.get(pdf_url, headers=headers, timeout=PDF_TIMEOUT)
+        r = SESSION.get(pdf_url, headers=headers)
         r.raise_for_status()
         if len(r.content) > MAX_PDF_BYTES:
             return [], "PDF too large to process"
@@ -718,12 +745,12 @@ def _cache_path(formatted_date: str) -> Path:
     return CACHE_DIR / f"{safe}.json"
 
 def cache_load(formatted_date: str) -> Optional[Dict]:
-    # Never serve "today" from cache; always scrape fresh to pick up new announcements.
+    # Always scrape fresh for today's date (in configured timezone)
     if is_today_formatted(formatted_date):
         return None
 
     now = datetime.now(timezone.utc)
-    # memory
+    # 1) Memory cache (TTL for speed)
     entry = _mem_cache.get(formatted_date)
     if entry:
         ts, data = entry
@@ -731,17 +758,15 @@ def cache_load(formatted_date: str) -> Optional[Dict]:
             return data
         else:
             _mem_cache.pop(formatted_date, None)
-    # disk
+
+    # 2) Disk cache: for past dates, serve if file exists (no TTL)
     path = _cache_path(formatted_date)
     if not path.exists():
         return None
     try:
-        age = now - datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-        if age > _mem_cache_ttl:
-            return None
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        _mem_cache[formatted_date] = (now, data)
+        _mem_cache[formatted_date] = (now, data)  # refresh memory cache
         return data
     except Exception as e:
         logger.debug(f"Cache load failed for {formatted_date}: {e}")
@@ -752,9 +777,11 @@ def cache_save(formatted_date: str, data: Dict):
         now = datetime.now(timezone.utc)
         _mem_cache[formatted_date] = (now, data)
         path = _cache_path(formatted_date)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(data, f)
-        # Update TXT index for "presence" check
+        tmp = path.with_suffix(".json.tmp")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)  # atomic
         _dates_index_add(formatted_date)
     except Exception as e:
         logger.debug(f"Cache save failed for {formatted_date}: {e}")
@@ -815,7 +842,7 @@ class ScrapeJob:
 
             self.update(is_running=True, progress=10, message="Setting up browser...", started_at=datetime.now(timezone.utc).isoformat())
             driver = setup_driver(headless=HEADLESS)
-            driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+            # Do not set driver page load timeout (remove hard cap)
 
             self.update(progress=20, message="Opening BSE announcements page...")
             safe_get(driver, "https://www.bseindia.com/corporates/ann.html", wait_css="body")
@@ -835,16 +862,7 @@ class ScrapeJob:
                 raise RuntimeError("Failed to submit form")
 
             self.update(progress=50, message="Waiting for results...")
-            if not wait_for_results_or_empty(driver, timeout=max(SELENIUM_WAIT, 25)):
-                # gentle fallback - send Enter again
-                try:
-                    el = driver.find_element(By.ID, "txtToDt")
-                    el.send_keys(Keys.ENTER)
-                    time.sleep(1.0)
-                except Exception:
-                    pass
-                if not wait_for_results_or_empty(driver, timeout=15):
-                    raise RuntimeError("Failed to load results")
+            wait_for_results_or_empty(driver)  # no timeout cap
 
             total_announcements = get_total_announcements(driver)
             self.update(total_announcements=total_announcements)
@@ -931,26 +949,18 @@ class MultiScrapeManager:
         self.jobs: Dict[str, ScrapeJob] = {}
 
     def _cleanup(self):
-        now = datetime.now(timezone.utc)
-        to_delete = []
-        with self.lock:
-            for jid, job in self.jobs.items():
-                st = job.get_status()
-                if not st.get("finished_at"):
-                    continue
-                try:
-                    finished = datetime.fromisoformat(st["finished_at"])
-                except Exception:
-                    continue
-                if (now - finished) > timedelta(minutes=JOB_TTL_MINUTES):
-                    to_delete.append(jid)
-            for jid in to_delete:
-                self.jobs.pop(jid, None)
+        # No cleanup time limit to avoid losing job history (removes time limits)
+        return
 
     def start(self, formatted_date: str) -> str:
-        job_id = uuid.uuid4().hex
-        job = ScrapeJob(job_id, formatted_date)
         with self.lock:
+            # Coalesce concurrent requests for the same date
+            for jid, job in self.jobs.items():
+                st = job.get_status()
+                if job.formatted_date == formatted_date and st.get("is_running"):
+                    return jid
+            job_id = uuid.uuid4().hex
+            job = ScrapeJob(job_id, formatted_date)
             self.jobs[job_id] = job
         job.start()
         self._cleanup()
