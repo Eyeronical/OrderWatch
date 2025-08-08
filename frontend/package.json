@@ -1,0 +1,41 @@
+{
+  "name": "final-website",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Track order wins from BSE corporate announcements",
+  "author": "Parth Goyal",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "start": "vite preview --port 3000 --strictPort",
+    "build": "vite build",
+    "build:prod": "vite build --mode production",
+    "preview": "vite preview --port 3000 --strictPort",
+    "serve": "vite preview --port 3000 --strictPort",
+    "clean": "rm -rf dist node_modules package-lock.json && npm install",
+    "lint": "eslint . --ext js,jsx --report-unused-disable-directives --max-warnings 0",
+    "lint:fix": "eslint . --ext js,jsx --fix",
+    "security-check": "npm audit",
+    "security-fix": "npm audit fix"
+  },
+  "dependencies": {
+    "dompurify": "^3.0.8",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.17",
+    "@vitejs/plugin-react": "^4.2.1",
+    "eslint": "^8.55.0",
+    "eslint-plugin-react": "^7.33.2",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.4.5",
+    "vite": "^5.4.19"
+  }
+}

@@ -1,0 +1,199 @@
+.simple-header {
+  background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 1.5rem 0;
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.simple-header::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 50% 30%, rgba(59, 130, 246, 0.08) 0%, transparent 50%),
+    radial-gradient(circle at 80% 80%, rgba(139, 92, 246, 0.06) 0%, transparent 50%);
+  pointer-events: none;
+}
+
+.header-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 2rem;
+  position: relative;
+  z-index: 2;
+}
+
+.header-content {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 2rem;
+}
+
+.brand-section {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+
+.logo {
+  width: 50px;
+  height: 50px;
+  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 6px 20px rgba(59, 130, 246, 0.25);
+  position: relative;
+}
+
+.logo::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  background: linear-gradient(135deg, #1e293b, #334155);
+  border-radius: 10px;
+  z-index: 1;
+}
+
+.logo-icon {
+  width: 24px;
+  height: 24px;
+  color: #3b82f6;
+  position: relative;
+  z-index: 2;
+}
+
+.logo-icon svg {
+  width: 100%;
+  height: 100%;
+  stroke-width: 2;
+}
+
+.brand-text h1 {
+  font-size: 1.875rem;
+  font-weight: 700;
+  color: #ffffff;
+  margin: 0 0 0.125rem 0;
+  line-height: 1.2;
+  background: linear-gradient(135deg, #ffffff, #e2e8f0);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.brand-text p {
+  font-size: 0.875rem;
+  color: #94a3b8;
+  margin: 0;
+  font-weight: 500;
+  letter-spacing: 0.025em;
+}
+
+.auth-section {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  position: relative;
+}
+
+.visit-counter {
+  color: #cbd5e1;
+  font-weight: 700;
+  font-size: 0.8rem;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.12);
+  padding: 0.5rem 0.75rem;
+  border-radius: 9999px;
+  line-height: 1;
+}
+
+.auth-buttons {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.login-btn {
+  padding: 0.75rem 1.5rem;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  color: #e2e8f0;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.login-btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: #ffffff;
+}
+
+.signup-btn {
+  padding: 0.75rem 1.5rem;
+  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+  border: none;
+  border-radius: 8px;
+  color: #ffffff;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+}
+
+.signup-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(59, 130, 246, 0.4);
+}
+
+.login-btn:focus-visible,
+.signup-btn:focus-visible {
+  outline: 3px solid rgba(99, 102, 241, 0.6);
+  outline-offset: 3px;
+}
+
+/* Simple inline notice; no dropdown/popup */
+.auth-notice {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: 0.5rem;
+  background: rgba(99, 102, 241, 0.15);
+  color: #e2e8f0;
+  border: 1px solid rgba(99, 102, 241, 0.35);
+  padding: 0.4rem 0.6rem;
+  border-radius: 9999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.auth-notice .dot { color: #a78bfa; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Unchanged styles trimmed for brevity */
+
+@media (max-width: 768px) {
+  .simple-header { padding: 1.25rem 0; }
+  .header-container { padding: 0 1rem; }
+  .header-content { gap: 1rem; }
+  .brand-section { gap: 1rem; }
+  .logo { width: 45px; height: 45px; }
+  .logo-icon { width: 20px; height: 20px; }
+  .brand-text h1 { font-size: 1.5rem; }
+  .brand-text p { font-size: 0.8rem; }
+  .auth-buttons { gap: 0.5rem; }
+  .login-btn, .signup-btn { padding: 0.625rem 1rem; font-size: 0.8rem; }
+  .visit-counter { display: none; } /* keep header compact on small screens */
+}

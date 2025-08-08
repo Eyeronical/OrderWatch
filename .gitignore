@@ -1,0 +1,96 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-debug.log*
+.eslintcache
+
+# Build output
+dist/
+build/
+out/
+public/build/
+.cache
+.parcel-cache
+.turbo
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+.secrets/
+private/
+config.js
+secrets.json
+api-keys.txt
+credentials.json
+
+# Logs
+logs/
+*.log
+debug.log
+error.log
+
+# IDE / Editor
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+coverage/
+*.lcov
+.nyc_output/
+.pytest_cache/
+
+# Python backend
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+venv/
+env/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+*.egg-info/
+htmlcov/
+.tox/
+.nox/
+
+# Deployment
+.vercel
+.netlify
+.surge
+.now
+
+# Temp
+tmp/
+temp/
+.tmp/
+.temp/
+*.tmp
+*.bak
+.node_repl_history
+
+# Archives
+*.7z
+*.gz
+*.zip
+*.tar
+*.rar
