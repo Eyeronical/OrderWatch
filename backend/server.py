@@ -59,6 +59,22 @@ PDF_WORKERS = int(os.getenv("PDF_WORKERS", "4"))
 # Visits counter persistence (optional)
 VISITS_FILE = Path(os.getenv("VISITS_FILE", "data/visits.count"))
 
+# ----------------------- Additional performance + storage -----------------------
+DATES_STORE_FILE = Path(os.getenv("DATES_STORE_FILE", "data/dates.index"))
+BLOCK_HEAVY_RESOURCES = os.getenv("BLOCK_HEAVY_RESOURCES", "1").lower() in ("1", "true", "yes")
+
+# PDF in-memory cache (avoid refetching same PDFs across runs/jobs)
+PDF_CACHE_TTL_MINUTES = int(os.getenv("PDF_CACHE_TTL_MINUTES", "10080"))  # 7 days
+PDF_CACHE_MAX_ENTRIES = int(os.getenv("PDF_CACHE_MAX_ENTRIES", "256"))
+
+# Reuse HTTP connections for PDFs
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": UA})
+
+_pdf_mem_cache: Dict[str, Tuple[datetime, List[Dict], str]] = {}
+_pdf_mem_cache_ttl = timedelta(minutes=PDF_CACHE_TTL_MINUTES)
+_pdf_cache_lock = threading.Lock()
+
 # ----------------------- Logging & Flask -----------------------
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s")
 logger = logging.getLogger("bse-scraper")
@@ -135,6 +151,53 @@ def visit_hit():
 def visit_get():
     return jsonify({"visits": _read_visits()}), 200
 
+# ----------------------- Storage helpers (TXT index + PDF cache) -----------------------
+def is_today_formatted(formatted_date: str) -> bool:
+    try:
+        return formatted_date == date.today().strftime("%d/%m/%Y")
+    except Exception:
+        return False
+
+def _dates_index_load() -> set:
+    try:
+        if not DATES_STORE_FILE.exists():
+            return set()
+        return {line.strip() for line in DATES_STORE_FILE.read_text(encoding="utf-8").splitlines() if line.strip()}
+    except Exception:
+        return set()
+
+def _dates_index_add(formatted_date: str):
+    try:
+        DATES_STORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        existing = _dates_index_load()
+        if formatted_date not in existing:
+            with DATES_STORE_FILE.open("a", encoding="utf-8") as f:
+                f.write(formatted_date + "\n")
+    except Exception as e:
+        logger.debug(f"Failed to update date index: {e}")
+
+def _pdf_cache_get(url: str) -> Optional[Tuple[List[Dict], str]]:
+    now = datetime.now(timezone.utc)
+    with _pdf_cache_lock:
+        entry = _pdf_mem_cache.get(url)
+        if not entry:
+            return None
+        ts, values, snippet = entry
+        if now - ts > _pdf_mem_cache_ttl:
+            _pdf_mem_cache.pop(url, None)
+            return None
+        return values, snippet
+
+def _pdf_cache_put(url: str, values: List[Dict], snippet: str):
+    now = datetime.now(timezone.utc)
+    with _pdf_cache_lock:
+        _pdf_mem_cache[url] = (now, values, snippet)
+        if len(_pdf_mem_cache) > PDF_CACHE_MAX_ENTRIES:
+            items = sorted(_pdf_mem_cache.items(), key=lambda kv: kv[1][0])
+            to_drop = len(_pdf_mem_cache) - PDF_CACHE_MAX_ENTRIES
+            for i in range(to_drop):
+                _pdf_mem_cache.pop(items[i][0], None)
+
 # ----------------------- Selenium helpers -----------------------
 def setup_driver(headless: bool = True) -> webdriver.Chrome:
     opts = Options()
@@ -154,13 +217,35 @@ def setup_driver(headless: bool = True) -> webdriver.Chrome:
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument(f"--user-agent={UA}")
     opts.add_argument("--remote-debugging-pipe")
+    # Reduce resource load: block images/plugins; keep CSS/JS
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.notifications": 2,
+        "profile.managed_default_content_settings.plugins": 2,
+    }
+    opts.add_experimental_option("prefs", prefs)
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
+
     driver = webdriver.Chrome(options=opts)
     try:
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     except Exception:
         pass
+
+    if BLOCK_HEAVY_RESOURCES:
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.execute_cdp_cmd("Network.setBlockedURLs", {
+                "urls": [
+                    "*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.ico",
+                    "*.mp4", "*.webm", "*.avi",
+                    "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot", "*.svg"
+                ]
+            })
+        except Exception as e:
+            logger.debug(f"CDP block setup failed: {e}")
+
     driver.set_script_timeout(60)
     return driver
 
@@ -466,7 +551,7 @@ def handle_pagination_and_scrape(driver: webdriver.Chrome, stop_event: threading
         except TimeoutException:
             break
         page_num += 1
-        time.sleep(0.8)
+        time.sleep(0.4)  # reduced from 0.8 for speed
     return orders
 
 # ----------------------- PDF utilities -----------------------
@@ -558,20 +643,30 @@ def extract_order_value_from_text(text: str) -> List[Dict]:
 def fetch_pdf_and_extract_values(pdf_url: str) -> Tuple[List[Dict], str]:
     if not _is_allowed_pdf_url(pdf_url):
         return [], "PDF URL not allowed"
+
+    cached = _pdf_cache_get(pdf_url)
+    if cached:
+        values, snippet = cached
+        return values, snippet
+
     try:
         headers = {"User-Agent": UA}
-        head = requests.head(pdf_url, headers=headers, timeout=PDF_TIMEOUT, allow_redirects=True)
+        head = SESSION.head(pdf_url, headers=headers, timeout=PDF_TIMEOUT, allow_redirects=True)
         clen = int(head.headers.get("Content-Length", "0")) if head.ok else 0
         if clen and clen > MAX_PDF_BYTES:
             return [], "PDF too large to process"
-        r = requests.get(pdf_url, headers=headers, timeout=PDF_TIMEOUT)
+
+        r = SESSION.get(pdf_url, headers=headers, timeout=PDF_TIMEOUT)
         r.raise_for_status()
         if len(r.content) > MAX_PDF_BYTES:
             return [], "PDF too large to process"
+
         text = extract_pdf_text(r.content)
         values = extract_order_value_from_text(text)
-        snippet = (text or "")[:500]
-        return values, snippet if snippet else "No text extracted from PDF"
+        snippet = (text or "")[:500] or "No text extracted from PDF"
+
+        _pdf_cache_put(pdf_url, values, snippet)
+        return values, snippet
     except Exception as e:
         logger.warning(f"PDF extraction failed: {str(e)[:120]}")
         return [], "PDF extraction failed"
@@ -623,6 +718,10 @@ def _cache_path(formatted_date: str) -> Path:
     return CACHE_DIR / f"{safe}.json"
 
 def cache_load(formatted_date: str) -> Optional[Dict]:
+    # Never serve "today" from cache; always scrape fresh to pick up new announcements.
+    if is_today_formatted(formatted_date):
+        return None
+
     now = datetime.now(timezone.utc)
     # memory
     entry = _mem_cache.get(formatted_date)
@@ -655,6 +754,8 @@ def cache_save(formatted_date: str, data: Dict):
         path = _cache_path(formatted_date)
         with path.open("w", encoding="utf-8") as f:
             json.dump(data, f)
+        # Update TXT index for "presence" check
+        _dates_index_add(formatted_date)
     except Exception as e:
         logger.debug(f"Cache save failed for {formatted_date}: {e}")
 
@@ -697,7 +798,7 @@ class ScrapeJob:
     def run(self):
         driver = None
         try:
-            # Serve from cache if available
+            # Serve from cache if available (not for today due to cache_load rule)
             cached = cache_load(self.formatted_date)
             if cached:
                 now_iso = datetime.now(timezone.utc).isoformat()
@@ -905,7 +1006,37 @@ def start_scrape():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    # If cached, short-circuit by creating a job that instantly returns cache (keeps API consistent)
+    # Presence check via TXT index (fast path) for non-today dates
+    try:
+        if not is_today_formatted(formatted_date):
+            existing_dates = _dates_index_load()
+            if formatted_date in existing_dates:
+                cached = cache_load(formatted_date)
+                if cached:
+                    job_id = uuid.uuid4().hex
+                    job = ScrapeJob(job_id, formatted_date)
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    job.update(
+                        is_running=False,
+                        progress=100,
+                        message="Served from cache (index hit)",
+                        results=cached,
+                        error=None,
+                        started_at=now_iso,
+                        finished_at=now_iso,
+                    )
+                    with scrape_manager.lock:
+                        scrape_manager.jobs[job_id] = job
+                    return jsonify({
+                        "message": "Scraping started (cache hit via index)",
+                        "date": formatted_date,
+                        "readable_date": date_obj.strftime("%B %d, %Y"),
+                        "job_id": job_id
+                    }), 202
+    except Exception:
+        pass
+
+    # If cached (non-today), short-circuit (keep API consistent)
     cached = cache_load(formatted_date)
     if cached:
         job_id = uuid.uuid4().hex
