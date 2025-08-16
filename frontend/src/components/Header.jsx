@@ -3,48 +3,23 @@ import './Header.css'
 
 const Header = () => {
   const [showAuthNotice, setShowAuthNotice] = useState(false)
-  const [visits, setVisits] = useState(null)
+  const [analysisRuns, setAnalysisRuns] = useState(null)
   const bumpedRef = useRef(false)
 
-  // Support both absolute API URL and Vite proxy
   const API = import.meta.env.VITE_API_URL || ''
 
-  const fetchVisits = async () => {
+  const fetchAnalysisRuns = async () => {
     try {
-      const res = await fetch(`${API}/api/visit`, { method: 'GET' })
+      const res = await fetch(`${API}/api/usage`, { method: 'GET' })
       const data = await res.json()
-      if (typeof data.visits === 'number') setVisits(data.visits)
+      if (typeof data.analysis_runs === 'number') setAnalysisRuns(data.analysis_runs)
     } catch {
-      // ignore
+
     }
   }
 
   useEffect(() => {
-    // Prevent double-increment in React 18 StrictMode (dev) and ensure 1 bump per tab
-    const sessionKey = 'visit-hit-v1'
-    const alreadyBumped = sessionStorage.getItem(sessionKey) === '1'
-    if (alreadyBumped || bumpedRef.current) {
-      fetchVisits()
-      return
-    }
-
-    let cancelled = false
-    const bump = async () => {
-      try {
-        const res = await fetch(`${API}/api/visit`, { method: 'POST' })
-        const data = await res.json()
-        if (!cancelled && typeof data.visits === 'number') setVisits(data.visits)
-      } catch {
-        // ignore
-      } finally {
-        bumpedRef.current = true
-        sessionStorage.setItem(sessionKey, '1')
-        // also fetch to confirm value
-        fetchVisits()
-      }
-    }
-    bump()
-    return () => { cancelled = true }
+    fetchAnalysisRuns()
   }, [API])
 
   const handleAuthClick = (e) => {
@@ -79,8 +54,8 @@ const Header = () => {
           </div>
 
           <div className="auth-section">
-            <div className="visit-counter" title="Total visits">
-              Visits: {visits === null ? '—' : visits.toLocaleString()}
+            <div className="usage-counter" title="Total analyses performed">
+              Analyses: {analysisRuns === null ? '—' : analysisRuns.toLocaleString()}
             </div>
             <div className="auth-buttons">
               <button className="login-btn" onClick={handleAuthClick}>Log In</button>

@@ -21,9 +21,6 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.keys import Keys
-
-# We won’t rely on WebDriverWait timeouts; we’ll poll without hard time caps
-# But import remains available if you want to reintroduce timeouts later
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
@@ -35,7 +32,6 @@ except Exception:
 
 SCRAPER_TZ = os.getenv("SCRAPER_TZ", "Asia/Kolkata")
 
-# Optional PDF libraries
 try:
     import PyPDF2
     HAS_PYPDF2 = True
@@ -48,36 +44,30 @@ try:
 except Exception:
     HAS_PDFMINER = False
 
-# ----------------------- Configuration -----------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 HEADLESS = os.getenv("HEADLESS", "1").lower() in ("1", "true", "yes")
-PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "90"))  # kept, but not enforced
-SELENIUM_WAIT = int(os.getenv("SELENIUM_WAIT", "25"))          # kept for compatibility
-PDF_TIMEOUT = int(os.getenv("PDF_TIMEOUT", "45"))              # kept, but not enforced
+PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "90"))
+SELENIUM_WAIT = int(os.getenv("SELENIUM_WAIT", "25"))
+PDF_TIMEOUT = int(os.getenv("PDF_TIMEOUT", "45"))
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(15 * 1024 * 1024)))
 API_KEY = os.getenv("API_KEY", "").strip()
 MIN_DATE = date(2010, 1, 1)
-JOB_TTL_MINUTES = int(os.getenv("JOB_TTL_MINUTES", "120"))     # kept, but not enforced for cleanup
+JOB_TTL_MINUTES = int(os.getenv("JOB_TTL_MINUTES", "120"))
 UA = os.getenv("SCRAPER_UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36")
 
-# Caching + performance
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "data/cache"))
-CACHE_TTL_MINUTES = int(os.getenv("CACHE_TTL_MINUTES", "1440"))  # still used for in-memory only
+CACHE_TTL_MINUTES = int(os.getenv("CACHE_TTL_MINUTES", "1440"))
 PDF_WORKERS = int(os.getenv("PDF_WORKERS", "4"))
 
-# Visits counter persistence (optional)
-VISITS_FILE = Path(os.getenv("VISITS_FILE", "data/visits.count"))
+USAGE_FILE = Path(os.getenv("USAGE_FILE", "data/analysis_runs.count"))
 
-# ----------------------- Additional performance + storage -----------------------
 DATES_STORE_FILE = Path(os.getenv("DATES_STORE_FILE", "data/dates.index"))
 BLOCK_HEAVY_RESOURCES = os.getenv("BLOCK_HEAVY_RESOURCES", "1").lower() in ("1", "true", "yes")
 
-# PDF in-memory cache (avoid refetching same PDFs across runs/jobs)
-PDF_CACHE_TTL_MINUTES = int(os.getenv("PDF_CACHE_TTL_MINUTES", "10080"))  # 7 days
+PDF_CACHE_TTL_MINUTES = int(os.getenv("PDF_CACHE_TTL_MINUTES", "10080"))
 PDF_CACHE_MAX_ENTRIES = int(os.getenv("PDF_CACHE_MAX_ENTRIES", "256"))
 
-# Reuse HTTP connections for PDFs
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA})
 
@@ -85,7 +75,6 @@ _pdf_mem_cache: Dict[str, Tuple[datetime, List[Dict], str]] = {}
 _pdf_mem_cache_ttl = timedelta(minutes=PDF_CACHE_TTL_MINUTES)
 _pdf_cache_lock = threading.Lock()
 
-# ----------------------- Logging & Flask -----------------------
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s")
 logger = logging.getLogger("bse-scraper")
 
@@ -124,44 +113,52 @@ def _require_api_key() -> bool:
     key = h or qs
     return bool(key) and hmac.compare_digest(key, API_KEY)
 
-# ----------------------- Visit counter (optional) -----------------------
-_visits_lock = threading.Lock()
+_analysis_runs_lock = threading.Lock()
 
-def _ensure_visits_file():
+def _ensure_analysis_runs_file():
     try:
-        VISITS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if not VISITS_FILE.exists():
-            VISITS_FILE.write_text("0")
+        USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not USAGE_FILE.exists():
+            USAGE_FILE.write_text("0")
     except Exception as e:
-        logger.warning(f"Could not prepare visits file: {e}")
+        logger.warning(f"Could not prepare analysis runs file: {e}")
 
-def _read_visits():
+def _read_analysis_runs():
     try:
-        return int(VISITS_FILE.read_text().strip())
+        return int(USAGE_FILE.read_text().strip())
     except Exception:
         return 0
 
-def _write_visits(v: int):
+def _write_analysis_runs(v: int):
     try:
-        VISITS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        VISITS_FILE.write_text(str(v))
+        USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        USAGE_FILE.write_text(str(v))
     except Exception as e:
-        logger.warning(f"Could not write visits file: {e}")
+        logger.warning(f"Could not write analysis runs file: {e}")
 
-_ensure_visits_file()
+def _increment_analysis_runs():
+    with _analysis_runs_lock:
+        current = _read_analysis_runs()
+        new_count = current + 1
+        _write_analysis_runs(new_count)
+        return new_count
 
-@app.route("/api/visit", methods=["POST"])
-def visit_hit():
-    with _visits_lock:
-        v = _read_visits() + 1
-        _write_visits(v)
-        return jsonify({"visits": v}), 200
+_ensure_analysis_runs_file()
+
+@app.route("/api/usage", methods=["GET"])
+def usage_get():
+    return jsonify({
+        "analysis_runs": _read_analysis_runs(),
+        "total_usage": _read_analysis_runs()
+    }), 200
 
 @app.route("/api/visit", methods=["GET"])
 def visit_get():
-    return jsonify({"visits": _read_visits()}), 200
+    return jsonify({
+        "visits": _read_analysis_runs(),
+        "analysis_runs": _read_analysis_runs()
+    }), 200
 
-# ----------------------- Storage helpers (TXT index + PDF cache) -----------------------
 _dates_index_lock = threading.Lock()
 
 def _now_in_config_tz() -> datetime:
@@ -170,7 +167,6 @@ def _now_in_config_tz() -> datetime:
             return datetime.now(ZoneInfo(SCRAPER_TZ))
         except Exception:
             pass
-    # Fallback to IST offset if tz not available/invalid
     return datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
 def is_today_formatted(formatted_date: str) -> bool:
@@ -215,12 +211,11 @@ def _pdf_cache_put(url: str, values: List[Dict], snippet: str):
     with _pdf_cache_lock:
         _pdf_mem_cache[url] = (now, values, snippet)
         if len(_pdf_mem_cache) > PDF_CACHE_MAX_ENTRIES:
-            items = sorted(_pdf_mem_cache.items(), key=lambda kv: kv[1][0])
+            items = sorted(_pdf_mem_cache.items(), key=lambda kv: kv[1])
             to_drop = len(_pdf_mem_cache) - PDF_CACHE_MAX_ENTRIES
             for i in range(to_drop):
                 _pdf_mem_cache.pop(items[i][0], None)
 
-# ----------------------- Selenium helpers -----------------------
 def setup_driver(headless: bool = True) -> webdriver.Chrome:
     opts = Options()
     if headless:
@@ -239,7 +234,6 @@ def setup_driver(headless: bool = True) -> webdriver.Chrome:
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument(f"--user-agent={UA}")
     opts.add_argument("--remote-debugging-pipe")
-    # Reduce resource load: block images/plugins; keep CSS/JS
     prefs = {
         "profile.managed_default_content_settings.images": 2,
         "profile.default_content_setting_values.notifications": 2,
@@ -268,11 +262,9 @@ def setup_driver(headless: bool = True) -> webdriver.Chrome:
         except Exception as e:
             logger.debug(f"CDP block setup failed: {e}")
 
-    # Do not set script or page load timeouts (to avoid premature closes)
     return driver
 
 def _wait_until_css(driver: webdriver.Chrome, css: str):
-    # Poll until selector appears (no hard timeout)
     while True:
         try:
             if driver.find_elements(By.CSS_SELECTOR, css):
@@ -285,7 +277,6 @@ def safe_get(driver: webdriver.Chrome, url: str, wait_css: str = "body"):
     try:
         driver.get(url)
     except Exception:
-        # Ignore and continue to polling
         pass
     _wait_until_css(driver, wait_css)
 
@@ -303,7 +294,6 @@ def validate_date(date_str: str) -> Tuple[str, datetime]:
 
 def set_date_field(driver: webdriver.Chrome, field_id: str, date_value: str, label: str) -> bool:
     try:
-        # Poll element without timeout expiry
         while True:
             els = driver.find_elements(By.ID, field_id)
             if els:
@@ -379,7 +369,6 @@ def submit_form(driver: webdriver.Chrome) -> bool:
             time.sleep(0.8)
             return True
 
-        # Fallback: press Enter on To Date field
         try:
             to_els = driver.find_elements(By.ID, "txtToDt")
             if to_els:
@@ -395,7 +384,6 @@ def submit_form(driver: webdriver.Chrome) -> bool:
         return False
 
 def wait_for_results_or_empty(driver: webdriver.Chrome) -> bool:
-    # Poll until either results table appears or page contains 'no records'
     while True:
         try:
             if driver.find_elements(By.CSS_SELECTOR, 'table[ng-repeat="cann in CorpannData.Table"]'):
@@ -407,7 +395,6 @@ def wait_for_results_or_empty(driver: webdriver.Chrome) -> bool:
             pass
         time.sleep(0.3)
 
-# ----------------------- Scraping utilities -----------------------
 def get_total_announcements(driver: webdriver.Chrome) -> int:
     try:
         els = driver.find_elements(By.CSS_SELECTOR, ".col-lg-6.text-right.ng-binding b.ng-binding")
@@ -463,7 +450,6 @@ def clean_company_name(company: str, title: str) -> str:
     name = re.sub(r"\s*\([^)]*\)\s*$", "", name)
     return name.title() if name else ""
 
-# Only collect; PDF analysis happens later in parallel
 def scrape_announcement_tables_on_page(driver: webdriver.Chrome, page_num: int, sink: List[Dict], stop_event: threading.Event) -> int:
     try:
         _wait_until_css(driver, 'table[ng-repeat="cann in CorpannData.Table"]')
@@ -572,12 +558,10 @@ def handle_pagination_and_scrape(driver: webdriver.Chrome, stop_event: threading
         moved = click_next_if_available(driver)
         if not moved:
             break
-        # small wait for next page to render
         time.sleep(0.5)
         page_num += 1
     return orders
 
-# ----------------------- PDF utilities -----------------------
 def _is_allowed_pdf_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -653,7 +637,6 @@ def extract_order_value_from_text(text: str) -> List[Dict]:
                 })
             except Exception:
                 continue
-    # de-dupe by (value, unit)
     dedup = []
     seen = set()
     for item in found:
@@ -674,7 +657,6 @@ def fetch_pdf_and_extract_values(pdf_url: str) -> Tuple[List[Dict], str]:
 
     try:
         headers = {"User-Agent": UA}
-        # No timeouts (per request), but keep size protection
         try:
             head = SESSION.head(pdf_url, headers=headers, allow_redirects=True)
             clen = int(head.headers.get("Content-Length", "0")) if head.ok else 0
@@ -719,7 +701,6 @@ def enrich_orders_with_pdfs(orders: List[Dict]):
             orders[idx]["total_value_crores"] = total
             orders[idx]["pdf_extract"] = snippet
 
-# ----------------------- De-duplication -----------------------
 def dedupe_orders(orders: List[Dict]) -> List[Dict]:
     seen = set()
     unique = []
@@ -735,7 +716,6 @@ def dedupe_orders(orders: List[Dict]) -> List[Dict]:
         unique.append(o)
     return unique
 
-# ----------------------- Caching layer -----------------------
 _mem_cache: Dict[str, Tuple[datetime, Dict]] = {}
 _mem_cache_ttl = timedelta(minutes=CACHE_TTL_MINUTES)
 
@@ -745,12 +725,10 @@ def _cache_path(formatted_date: str) -> Path:
     return CACHE_DIR / f"{safe}.json"
 
 def cache_load(formatted_date: str) -> Optional[Dict]:
-    # Always scrape fresh for today's date (in configured timezone)
     if is_today_formatted(formatted_date):
         return None
 
     now = datetime.now(timezone.utc)
-    # 1) Memory cache (TTL for speed)
     entry = _mem_cache.get(formatted_date)
     if entry:
         ts, data = entry
@@ -759,14 +737,13 @@ def cache_load(formatted_date: str) -> Optional[Dict]:
         else:
             _mem_cache.pop(formatted_date, None)
 
-    # 2) Disk cache: for past dates, serve if file exists (no TTL)
     path = _cache_path(formatted_date)
     if not path.exists():
         return None
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        _mem_cache[formatted_date] = (now, data)  # refresh memory cache
+        _mem_cache[formatted_date] = (now, data)
         return data
     except Exception as e:
         logger.debug(f"Cache load failed for {formatted_date}: {e}")
@@ -781,12 +758,11 @@ def cache_save(formatted_date: str, data: Dict):
         path.parent.mkdir(parents=True, exist_ok=True)
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, path)  # atomic
+        os.replace(tmp, path)
         _dates_index_add(formatted_date)
     except Exception as e:
         logger.debug(f"Cache save failed for {formatted_date}: {e}")
 
-# ----------------------- Job management -----------------------
 class ScrapeJob:
     def __init__(self, job_id: str, formatted_date: str):
         self.job_id = job_id
@@ -825,7 +801,6 @@ class ScrapeJob:
     def run(self):
         driver = None
         try:
-            # Serve from cache if available (not for today due to cache_load rule)
             cached = cache_load(self.formatted_date)
             if cached:
                 now_iso = datetime.now(timezone.utc).isoformat()
@@ -842,7 +817,6 @@ class ScrapeJob:
 
             self.update(is_running=True, progress=10, message="Setting up browser...", started_at=datetime.now(timezone.utc).isoformat())
             driver = setup_driver(headless=HEADLESS)
-            # Do not set driver page load timeout (remove hard cap)
 
             self.update(progress=20, message="Opening BSE announcements page...")
             safe_get(driver, "https://www.bseindia.com/corporates/ann.html", wait_css="body")
@@ -862,7 +836,7 @@ class ScrapeJob:
                 raise RuntimeError("Failed to submit form")
 
             self.update(progress=50, message="Waiting for results...")
-            wait_for_results_or_empty(driver)  # no timeout cap
+            wait_for_results_or_empty(driver)
 
             total_announcements = get_total_announcements(driver)
             self.update(total_announcements=total_announcements)
@@ -878,7 +852,6 @@ class ScrapeJob:
                 self.update(progress=75, message="Analyzing PDFs for order values...")
                 enrich_orders_with_pdfs(orders)
 
-            # Finalize results
             if orders:
                 orders.sort(key=lambda x: x.get("total_value_crores", 0), reverse=True)
                 total_value = round(sum(o.get("total_value_crores", 0) for o in orders), 2)
@@ -907,7 +880,6 @@ class ScrapeJob:
                     "message": "No order awards found for this date",
                 }
 
-            # Cache and finish
             cache_save(self.formatted_date, results)
             self.update(
                 is_running=False,
@@ -949,12 +921,10 @@ class MultiScrapeManager:
         self.jobs: Dict[str, ScrapeJob] = {}
 
     def _cleanup(self):
-        # No cleanup time limit to avoid losing job history (removes time limits)
         return
 
     def start(self, formatted_date: str) -> str:
         with self.lock:
-            # Coalesce concurrent requests for the same date
             for jid, job in self.jobs.items():
                 st = job.get_status()
                 if job.formatted_date == formatted_date and st.get("is_running"):
@@ -992,7 +962,6 @@ class MultiScrapeManager:
 
 scrape_manager = MultiScrapeManager()
 
-# ----------------------- API endpoints -----------------------
 @app.route("/api/health", methods=["GET"])
 def health_check():
     return jsonify({
@@ -1016,7 +985,9 @@ def start_scrape():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    # Presence check via TXT index (fast path) for non-today dates
+    analysis_count = _increment_analysis_runs()
+    logger.info(f"Analysis run #{analysis_count} started for date: {formatted_date}")
+
     try:
         if not is_today_formatted(formatted_date):
             existing_dates = _dates_index_load()
@@ -1041,12 +1012,12 @@ def start_scrape():
                         "message": "Scraping started (cache hit via index)",
                         "date": formatted_date,
                         "readable_date": date_obj.strftime("%B %d, %Y"),
-                        "job_id": job_id
+                        "job_id": job_id,
+                        "analysis_run_number": analysis_count
                     }), 202
     except Exception:
         pass
 
-    # If cached (non-today), short-circuit (keep API consistent)
     cached = cache_load(formatted_date)
     if cached:
         job_id = uuid.uuid4().hex
@@ -1067,7 +1038,8 @@ def start_scrape():
             "message": "Scraping started (cache hit)",
             "date": formatted_date,
             "readable_date": date_obj.strftime("%B %d, %Y"),
-            "job_id": job_id
+            "job_id": job_id,
+            "analysis_run_number": analysis_count
         }), 202
 
     try:
@@ -1080,7 +1052,8 @@ def start_scrape():
         "message": "Scraping started",
         "date": formatted_date,
         "readable_date": date_obj.strftime("%B %d, %Y"),
-        "job_id": job_id
+        "job_id": job_id,
+        "analysis_run_number": analysis_count
     }), 202
 
 @app.route("/api/status", methods=["GET"])
@@ -1128,7 +1101,6 @@ def stop_scraping():
         return jsonify({"error": "Job not found"}), 404
     return jsonify({"message": "Stop requested", "job_id": job_id}), 202
 
-# ----------------------- Error handlers -----------------------
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({"error": "Endpoint not found"}), 404
@@ -1138,6 +1110,5 @@ def internal_error(error):
     logger.exception("Unhandled server error")
     return jsonify({"error": "Internal server error"}), 500
 
-# ----------------------- Entry point -----------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5001")), debug=False)

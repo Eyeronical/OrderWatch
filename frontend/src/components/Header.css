@@ -100,7 +100,7 @@
   position: relative;
 }
 
-.visit-counter {
+.usage-counter {
   color: #cbd5e1;
   font-weight: 700;
   font-size: 0.8rem;
@@ -159,7 +159,6 @@
   outline-offset: 3px;
 }
 
-/* Simple inline notice; no dropdown/popup */
 .auth-notice {
   display: inline-flex;
   align-items: center;
@@ -175,14 +174,14 @@
   animation: fadeIn 0.2s ease-out;
 }
 
-.auth-notice .dot { color: #a78bfa; }
+.auth-notice .dot { 
+  color: #a78bfa; 
+}
 
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(-2px); }
   to { opacity: 1; transform: translateY(0); }
 }
-
-/* Unchanged styles trimmed for brevity */
 
 @media (max-width: 768px) {
   .simple-header { padding: 1.25rem 0; }
@@ -195,5 +194,5 @@
   .brand-text p { font-size: 0.8rem; }
   .auth-buttons { gap: 0.5rem; }
   .login-btn, .signup-btn { padding: 0.625rem 1rem; font-size: 0.8rem; }
-  .visit-counter { display: none; } /* keep header compact on small screens */
+  .usage-counter { display: none; }
 }
